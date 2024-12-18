@@ -11,16 +11,29 @@ class MADQLAgent:
         self.game = game
         self.episode_count = 0
         self.total_tasks_completed = 0
-        self.learning_stats = {
-            'episode_rewards': [],
-            'q_value_history': [],
-            'bid_history': [],
-            'task_distribution': {},
-            'completion_times': [],
-            'congestion_levels': [],
-            'bid_success_rate': [],  # Track successful vs unsuccessful bids
-            'bid_values': []  # Track actual bid values chosen
+        
+        # Streamlined core metrics
+        self.metrics = {
+            'episode_rewards': [],      # Core learning performance
+            'completion_times': [],     # Task completion efficiency
+            'team_throughput': {        # Team collaboration efficiency
+                'window_size': 100,     # Rolling window size
+                'tasks_completed': 0,   # Total tasks in current window
+                'time_elapsed': 0.0,    # Time elapsed in current window
+                'window_start': time.time(),
+                'history': []           # List of (tasks/second) measurements
+            },
+            'agent_performance': {}     # Per-agent performance tracking
         }
+        
+        # Initialize agent performance tracking
+        for robot in game.robots:
+            self.metrics['agent_performance'][robot.id] = {
+                'tasks_completed': 0,
+                'avg_completion_time': 0.0,
+                'success_rate': 0.0,
+                'last_update': time.time()
+            }
         
         # Initialize learned weights for different factors
         self.factor_weights = {
@@ -412,7 +425,7 @@ class MADQLAgent:
                 self.factor_weights[k] /= total
     
     def update(self, robot, old_state, action, reward, new_state):
-        """Enhanced update handling dynamic agents"""
+        """Enhanced update with streamlined metrics"""
         robot_idx = robot.id
         
         # Ensure robot's agent is active
@@ -469,14 +482,20 @@ class MADQLAgent:
             priority = min((td_error + 1e-6) ** self.priority_alpha, self.max_priority)
             self.dqn.remember(old_state, action_idx, reward, new_state, priority)
             
-            # Update task statistics if applicable
+            # Update task statistics and metrics if applicable
             if isinstance(action, Task) and robot.target == action:
                 self.agent_stats[robot_idx]['total_tasks'] += 1
                 self.total_tasks_completed += 1
                 
+                completion_time = None
                 if hasattr(robot, 'last_task_start'):
                     completion_time = time.time() - robot.last_task_start
-                    self.learning_stats['completion_times'].append(completion_time)
+                
+                # Update core metrics
+                self.update_metrics(robot, reward, completion_time)
+            else:
+                # Update metrics without completion time
+                self.update_metrics(robot, reward)
             
             # Train the network focusing on active agents
             self._train_active_agents()
@@ -548,17 +567,99 @@ class MADQLAgent:
         return congestion
         
     def get_learning_stats(self):
-        """Get learning statistics for monitoring"""
-        if not self.learning_stats['episode_rewards']:
-            return None
+        """Get streamlined learning statistics for monitoring"""
+        return self.get_performance_summary()
+
+    def update_metrics(self, robot, reward, completion_time=None):
+        """Update core performance metrics"""
+        current_time = time.time()
+        
+        # 1. Episode Rewards (keep last 1000 rewards)
+        self.metrics['episode_rewards'].append(reward)
+        if len(self.metrics['episode_rewards']) > 1000:
+            self.metrics['episode_rewards'] = self.metrics['episode_rewards'][-1000:]
+        
+        # 2. Task Completion Time
+        if completion_time is not None:
+            self.metrics['completion_times'].append(completion_time)
+            if len(self.metrics['completion_times']) > 1000:
+                self.metrics['completion_times'] = self.metrics['completion_times'][-1000:]
+        
+        # 3. Team Throughput
+        window = self.metrics['team_throughput']
+        window['tasks_completed'] += 1
+        window['time_elapsed'] = current_time - window['window_start']
+        
+        # Update throughput every window_size tasks or 60 seconds
+        if (window['tasks_completed'] >= window['window_size'] or 
+            window['time_elapsed'] >= 60.0):
+            throughput = window['tasks_completed'] / max(window['time_elapsed'], 1e-6)
+            window['history'].append(throughput)
+            if len(window['history']) > 10:  # Keep last 10 windows
+                window['history'] = window['history'][-10:]
             
-        return {
-            'avg_reward': sum(self.learning_stats['episode_rewards'][-100:]) / len(self.learning_stats['episode_rewards'][-100:]),
-            'avg_q_value': sum(self.learning_stats['q_value_history'][-100:]) / len(self.learning_stats['q_value_history'][-100:]),
-            'avg_bid': sum(self.learning_stats['bid_history'][-100:]) / len(self.learning_stats['bid_history'][-100:]),
-            'total_episodes': self.episode_count
-        }
-    
+            # Reset window
+            window['tasks_completed'] = 0
+            window['time_elapsed'] = 0.0
+            window['window_start'] = current_time
+        
+        # 4. Agent Performance
+        if robot.id in self.metrics['agent_performance']:
+            agent_stats = self.metrics['agent_performance'][robot.id]
+            agent_stats['tasks_completed'] += 1
+            
+            # Update average completion time
+            if completion_time is not None:
+                agent_stats['avg_completion_time'] = (
+                    0.95 * agent_stats['avg_completion_time'] +
+                    0.05 * completion_time  # Exponential moving average
+                )
+            
+            # Update success rate (based on positive rewards)
+            time_diff = current_time - agent_stats['last_update']
+            if time_diff > 0:
+                success = 1.0 if reward > 0 else 0.0
+                agent_stats['success_rate'] = (
+                    0.95 * agent_stats['success_rate'] +
+                    0.05 * success  # Exponential moving average
+                )
+            
+            agent_stats['last_update'] = current_time
+
+    def get_performance_summary(self):
+        """Get concise performance summary"""
+        current_time = time.time()
+        
+        try:
+            summary = {
+                # Overall team performance
+                'team_performance': {
+                    'total_tasks_completed': self.total_tasks_completed,
+                    'avg_reward': sum(self.metrics['episode_rewards'][-100:]) / 100 if self.metrics['episode_rewards'] else 0,
+                    'avg_completion_time': sum(self.metrics['completion_times'][-100:]) / 100 if self.metrics['completion_times'] else 0,
+                    'current_throughput': self.metrics['team_throughput']['tasks_completed'] / 
+                                        max(current_time - self.metrics['team_throughput']['window_start'], 1e-6),
+                    'avg_throughput': sum(self.metrics['team_throughput']['history']) / 
+                                    len(self.metrics['team_throughput']['history']) if self.metrics['team_throughput']['history'] else 0
+                },
+                
+                # Per-agent performance
+                'agent_performance': {
+                    robot_id: {
+                        'tasks_completed': stats['tasks_completed'],
+                        'avg_completion_time': stats['avg_completion_time'],
+                        'success_rate': stats['success_rate']
+                    }
+                    for robot_id, stats in self.metrics['agent_performance'].items()
+                }
+            }
+            
+            return summary
+            
+        except Exception as e:
+            print(f"Warning: Error generating performance summary: {e}")
+            return None
+
     def share_information(self, robot):
         """Share and process information with other robots"""
         current_time = time.time()
