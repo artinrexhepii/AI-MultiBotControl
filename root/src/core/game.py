@@ -236,7 +236,7 @@ class Game:
             robot_state = self.madql.get_state(robot)
             for task in self.tasks:
                 # Base bid on Q-value
-                q_value = robot.q_table[robot_state].get(task, 0)
+                q_value = robot.get_q_value(robot_state, task)
                 
                 # Adjust bid based on various factors
                 distance = robot.manhattan_distance((robot.x, robot.y), task.get_position())
@@ -282,6 +282,11 @@ class Game:
                 assigned_tasks.add(task)
                 assigned_robots.add(robot)
                 
+                # Update Q-value with positive reward for winning bid
+                robot_state = self.madql.get_state(robot)
+                current_q = robot.get_q_value(robot_state, task)
+                robot.update_q_value(robot_state, task, current_q + 0.1 * (bid_value - current_q))
+                
                 self.add_status_message(
                     f"Auction: Robot {robot.id} won P{task.priority} task with bid {bid_value:.1f}"
                 )
@@ -322,7 +327,7 @@ class Game:
         ), reverse=True)
             
         # Process all robots, not just active ones
-        for robot in self.robots:
+        for robot in active_robots:
             if current_time - robot.last_move_time < MOVE_DELAY:
                 continue  # Skip if not enough time has passed since last move
                 
@@ -339,9 +344,20 @@ class Game:
 
             if not robot.path:
                 if robot.target:
+                    # Consider other robots' positions and planned paths when finding a path
+                    blocked_positions = set()
+                    for other_robot in self.robots:
+                        if other_robot != robot:
+                            # Add current position
+                            blocked_positions.add((other_robot.x, other_robot.y))
+                            # Add next planned position if any
+                            if other_robot.path and len(other_robot.path) > 0:
+                                blocked_positions.add(other_robot.path[0])
+                    
                     robot.path = self.astar.find_path(
                         (robot.x, robot.y),
-                        robot.target.get_position()
+                        robot.target.get_position(),
+                        blocked_positions
                     )
                     if robot.path:
                         path_length = len(robot.path)
@@ -360,41 +376,61 @@ class Game:
             if robot.path:
                 next_pos = robot.path[0]
                 
-                # Check for collision
-                collision = False
-                colliding_robot = None
+                # Check for potential deadlock
+                deadlock = False
+                deadlock_robot = None
                 for other_robot in self.robots:
                     if other_robot != robot:
-                        # Check current position
-                        if (other_robot.x, other_robot.y) == next_pos:
-                            collision = True
-                            colliding_robot = other_robot
+                        # Check if robots are facing each other
+                        if (other_robot.path and 
+                            other_robot.path[0] == (robot.x, robot.y) and 
+                            next_pos == (other_robot.x, other_robot.y)):
+                            deadlock = True
+                            deadlock_robot = other_robot
                             break
                         # Check if other robot is planning to move to our next position
                         elif (other_robot.path and 
                               other_robot.path[0] == next_pos):
-                            # Consider task priorities in collision resolution
+                            # Consider task priorities in deadlock resolution
                             if robot.target and other_robot.target:
                                 if robot.target.priority < other_robot.target.priority:
-                                    collision = True
-                                    colliding_robot = other_robot
+                                    deadlock = True
+                                    deadlock_robot = other_robot
                                     break
                                 elif robot.target.priority == other_robot.target.priority:
                                     # If same priority, consider waiting time and distance
                                     if robot.waiting_time < other_robot.waiting_time:
-                                        collision = True
-                                        colliding_robot = other_robot
+                                        deadlock = True
+                                        deadlock_robot = other_robot
                                         break
                                     elif robot.waiting_time == other_robot.waiting_time:
                                         # If same waiting time, let robot closer to target proceed
                                         if (other_robot.target and
                                             other_robot.manhattan_distance((other_robot.x, other_robot.y), other_robot.target.get_position()) < 
                                             robot.manhattan_distance((robot.x, robot.y), robot.target.get_position())):
-                                            collision = True
-                                            colliding_robot = other_robot
+                                            deadlock = True
+                                            deadlock_robot = other_robot
                                             break
 
-                if not collision:
+                if deadlock:
+                    robot.waiting = True
+                    if deadlock_robot:
+                        # If both robots have been waiting too long, force one to find alternative path
+                        if (robot.waiting and deadlock_robot.waiting and 
+                            current_time - robot.last_move_time > MOVE_DELAY * 3):
+                            # Robot with lower priority task should find alternative
+                            if (robot.target and deadlock_robot.target and 
+                                robot.target.priority <= deadlock_robot.target.priority):
+                                robot.path = []  # Force path recalculation
+                                self.add_status_message(
+                                    f"Robot {robot.id}: Breaking deadlock, finding alternative path"
+                                )
+                            elif robot.waiting_time > deadlock_robot.waiting_time:
+                                robot.path = []  # Force path recalculation
+                                self.add_status_message(
+                                    f"Robot {robot.id}: Breaking deadlock, waited too long"
+                                )
+                else:
                     # Get old state before moving
                     old_state = self.madql.get_state(robot)
                     
@@ -422,33 +458,6 @@ class Game:
                         self.add_status_message(
                             f"Robot {robot.id}: Completed P{completed_priority} task! Total: {robot.completed_tasks}"
                         )
-                else:
-                    robot.waiting = True
-                    if colliding_robot:
-                        # If both robots are waiting too long, force one to find alternative path
-                        if (robot.waiting and colliding_robot.waiting and 
-                            current_time - robot.last_move_time > MOVE_DELAY * 3):
-                            # Robot with lower priority task should find alternative
-                            if (robot.target and colliding_robot.target and 
-                                robot.target.priority <= colliding_robot.target.priority):
-                                robot.path = []  # Force path recalculation
-                                self.add_status_message(
-                                    f"Robot {robot.id}: Finding alternative path (lower priority)"
-                                )
-                            elif robot.waiting_time > colliding_robot.waiting_time:
-                                robot.path = []  # Force path recalculation
-                                self.add_status_message(
-                                    f"Robot {robot.id}: Finding alternative path (waited longer)"
-                                )
-                        else:
-                            self.add_status_message(
-                                f"Robot {robot.id}: Waiting for Robot {colliding_robot.id} to move"
-                            )
-        
-        # Check if simulation should end
-        if self.end_simulation and not any(robot.target for robot in self.robots):
-            self.simulation_running = False
-            self.performance_metrics = PerformanceMetrics.calculate_metrics(self)
 
     def generate_random(self):
         # Clear the grid and robots
@@ -489,10 +498,14 @@ class Game:
                 pygame.draw.rect(self.screen, BLACK, rect, 1)
                 
                 if self.grid[y][x] == CellType.ROBOT:
-                    self.screen.blit(robot_image, (x * CELL_SIZE, y * CELL_SIZE))
+                    pygame.draw.circle(self.screen, BLUE, 
+                                    (x * CELL_SIZE + CELL_SIZE//2, 
+                                     y * CELL_SIZE + CELL_SIZE//2), 
+                                    CELL_SIZE//3)
                 elif self.grid[y][x] == CellType.OBSTACLE:
-                    self.screen.blit(obstacle_image, (x * CELL_SIZE, y * CELL_SIZE))
-
+                    pygame.draw.rect(self.screen, RED, 
+                                   (x * CELL_SIZE + 5, y * CELL_SIZE + 5, 
+                                    CELL_SIZE - 10, CELL_SIZE - 10))
                 elif self.grid[y][x] == CellType.TARGET:
                     pygame.draw.rect(self.screen, GREEN,
                                    (x * CELL_SIZE + 5, y * CELL_SIZE + 5,
