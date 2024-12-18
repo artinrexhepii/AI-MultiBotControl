@@ -37,41 +37,36 @@ class Grid:
         return False
         
     def move_robot(self, robot, new_x, new_y):
-        """Move robot to new position"""
-        # Check bounds
+        """Move robot to new position with improved collision checking"""
         if not (0 <= new_x < GRID_SIZE and 0 <= new_y < GRID_SIZE):
-            print(f"Move failed: Position ({new_x}, {new_y}) out of bounds")  # Debug print
             return False
-        
-        # Get cell types
-        current_cell = self.get_cell(robot.x, robot.y)
-        target_cell = self.get_cell(new_x, new_y)
-        
-        print(f"Moving robot from ({robot.x}, {robot.y}) [{current_cell}] to ({new_x}, {new_y}) [{target_cell}]")  # Debug print
-        
-        # Allow movement to empty cells, tasks, and targets
-        if target_cell in [CellType.EMPTY, CellType.TASK, CellType.TARGET]:
-            # Check for other robots in target position
-            if self.game:
-                for other_robot in self.game.robots:
-                    if other_robot != robot and (other_robot.x, other_robot.y) == (new_x, new_y):
-                        print(f"Move failed: Position ({new_x}, {new_y}) occupied by another robot")  # Debug print
-                        return False
             
-            # Clear old position
-            self.set_cell(robot.x, robot.y, CellType.EMPTY)
-            
-            # Update robot position
-            robot.x, robot.y = new_x, new_y
-            
-            # Set new position to robot
-            self.set_cell(new_x, new_y, CellType.ROBOT)
-            
-            print(f"Move successful: Robot now at ({robot.x}, {robot.y})")  # Debug print
+        # If trying to move to current position, consider it a success
+        if (robot.x, robot.y) == (new_x, new_y):
             return True
-        else:
-            print(f"Move failed: Target cell type {target_cell} not allowed")  # Debug print
+            
+        current_cell = self.get_cell(robot.x, robot.y)
+        next_cell = self.get_cell(new_x, new_y)
+        
+        print(f"Moving robot from ({robot.x}, {robot.y}) [{current_cell}] to ({new_x}, {new_y}) [{next_cell}]")
+        
+        # Check if movement is valid
+        if next_cell == CellType.OBSTACLE:
+            print("Move failed: Target cell is an obstacle")
             return False
+            
+        # Check if another robot is at the target position
+        for other_robot in self.game.robots:
+            if other_robot != robot and (other_robot.x, other_robot.y) == (new_x, new_y):
+                print("Move failed: Position occupied by another robot")
+                return False
+            
+        # Move robot
+        self.grid[robot.y][robot.x] = CellType.EMPTY
+        self.grid[new_y][new_x] = CellType.ROBOT
+        
+        print(f"Move successful: Robot now at ({new_x}, {new_y})")
+        return True
         
     def add_task(self, x, y, priority=None):
         """Add task to grid"""
@@ -88,33 +83,19 @@ class Grid:
         return None
         
     def remove_task(self, task):
-        """Remove task from grid"""
+        """Remove a task from the grid and task list"""
         if task in self.tasks:
-            # Check if there's a robot at this position
-            robot_at_position = False
-            if self.game:
-                for robot in self.game.robots:
-                    if (robot.x, robot.y) == (task.x, task.y):
-                        robot_at_position = True
-                        break
-            
-            # Only set cell to empty if no robot is there
-            if not robot_at_position:
-                self.set_cell(task.x, task.y, CellType.EMPTY)
-            
-            # Remove task from tracking
             self.tasks.remove(task)
-            print(f"Removed task at ({task.x}, {task.y}), robot_at_position: {robot_at_position}")  # Debug print
-            return True
-        return False
-        
+            self.grid[task.y][task.x] = CellType.EMPTY
+            print(f"Task removed from ({task.x}, {task.y})")
+            
     def mark_task_assigned(self, task):
-        """Mark task as assigned"""
+        """Mark a task as assigned and update grid"""
         if task in self.tasks:
-            self.set_cell(task.x, task.y, CellType.TARGET)
-            return True
-        return False
-        
+            task.assigned = True
+            x, y = task.x, task.y
+            self.grid[y][x] = CellType.TARGET
+            
     def generate_random_task(self):
         """Generate random task with improved placement"""
         # Check if we should generate a task

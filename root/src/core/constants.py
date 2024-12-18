@@ -1,4 +1,10 @@
 import pygame
+import os
+
+# Get the absolute path to the images directory
+current_dir = os.path.dirname(os.path.abspath(__file__))
+root_dir = os.path.dirname(os.path.dirname(current_dir))
+images_dir = os.path.join(root_dir, 'src', 'images')
 
 # Window Constants
 WINDOW_SIZE = 800
@@ -16,10 +22,12 @@ BLUE = (0, 0, 255)
 GREEN = (0, 255, 0)
 YELLOW = (255, 255, 0)
 PURPLE = (128, 0, 128)
-robot_image = pygame.image.load('root/src/images/robot.png')  
-robot_image = pygame.transform.scale(robot_image, (CELL_SIZE, CELL_SIZE))  
-obstacle_image = pygame.image.load('root/src/images/barrier.png')
-obstacle_image = pygame.transform.scale(obstacle_image, (CELL_SIZE, CELL_SIZE))  
+
+# Load images using absolute paths
+robot_image = pygame.image.load(os.path.join(images_dir, 'robot.png'))
+robot_image = pygame.transform.scale(robot_image, (CELL_SIZE, CELL_SIZE))
+obstacle_image = pygame.image.load(os.path.join(images_dir, 'barrier.png'))
+obstacle_image = pygame.transform.scale(obstacle_image, (CELL_SIZE, CELL_SIZE))
 
 # MADQL Parameters
 LEARNING_RATE = 0.1

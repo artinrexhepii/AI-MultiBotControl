@@ -78,13 +78,14 @@ class Game:
     def _handle_grid_click(self, x, y):
         """Handle clicks on the grid"""
         if self.current_tool == 'robot':
-            if self.grid.add_robot(x, y, Robot(x, y)):
-                self.robot_counter += 1
-                new_robot = self.robots[-1]
-                new_robot.id = self.robot_counter
+            new_robot = Robot(x, y)
+            self.robot_counter += 1
+            new_robot.id = self.robot_counter
+            if self.grid.add_robot(x, y, new_robot):
+                self.robots.append(new_robot)
                 self.add_status_message(f"Robot {new_robot.id} placed at ({x}, {y})")
                 if self.simulation_running:
-                    self.reallocate_all_tasks()
+                    self.auction_tasks()
         elif self.current_tool == 'obstacle':
             self.grid.add_obstacle(x, y)
         elif self.current_tool == 'task':
@@ -92,7 +93,7 @@ class Game:
             if task:
                 self.add_status_message(f"Created P{task.priority} task at ({x}, {y})")
                 if self.simulation_running:
-                    self.assign_tasks()
+                    self.auction_tasks()
 
     def _generate_random_scenario(self):
         """Generate random scenario"""
@@ -157,7 +158,14 @@ class Game:
 
     def assign_tasks(self):
         """Assign tasks to robots using MADQL"""
+        # Get unassigned robots and available tasks
         unassigned_robots = [robot for robot in self.robots if not robot.target]
+        available_tasks = [task for task in self.grid.tasks if not task.assigned]
+        
+        if not unassigned_robots or not available_tasks:
+            return
+            
+        print(f"Assigning tasks to {len(unassigned_robots)} robots, {len(available_tasks)} tasks available")
         
         for robot in unassigned_robots:
             # Get current state
@@ -170,7 +178,21 @@ class Game:
                 # Mark task as assigned
                 self.grid.mark_task_assigned(chosen_task)
                 robot.set_target(chosen_task)
-                self.grid.tasks.remove(chosen_task)
+                
+                # Find path to the task
+                path = self.astar.find_path(
+                    (robot.x, robot.y),
+                    chosen_task.get_position(),
+                    robot=robot
+                )
+                
+                if path:
+                    robot.path = path
+                    print(f"Robot {robot.id} assigned to task at ({chosen_task.x}, {chosen_task.y}) with path length {len(path)}")
+                else:
+                    print(f"No path found for Robot {robot.id} to assigned task")
+                    robot.target = None
+                    continue
                 
                 # Get new state and reward
                 new_state = self.madql.get_state(robot)
@@ -185,12 +207,6 @@ class Game:
 
     def auction_tasks(self):
         """Auction available tasks to robots"""
-        current_time = time.time()
-        if current_time - self.last_auction_time < self.auction_interval:
-            return
-        
-        self.last_auction_time = current_time
-        
         # Get unassigned robots and available tasks
         unassigned_robots = [robot for robot in self.robots if not robot.target]
         available_tasks = [task for task in self.grid.tasks if not task.assigned]
@@ -198,7 +214,7 @@ class Game:
         if not unassigned_robots or not available_tasks:
             return
         
-        print(f"Auction starting with {len(unassigned_robots)} robots and {len(available_tasks)} tasks")  # Debug print
+        print(f"Auction starting with {len(unassigned_robots)} robots and {len(available_tasks)} tasks")
         
         # Initialize bid tracking
         all_bids = []
@@ -206,14 +222,17 @@ class Game:
         # Collect bids from all unassigned robots for all tasks
         for robot in unassigned_robots:
             for task in available_tasks:
+                # Skip if task is too close to robot's current position
+                if abs(robot.x - task.x) + abs(robot.y - task.y) < 2:
+                    continue
+                    
                 chosen_task, bid_value = self.madql.calculate_bid(robot, [task])
                 if chosen_task:
                     all_bids.append((robot, chosen_task, bid_value))
-                    print(f"Robot {robot.id} bid {bid_value:.2f} for task at ({task.x}, {task.y})")  # Debug print
-                    self.add_status_message(f"Robot {robot.id} bid {bid_value:.2f} for task at ({task.x}, {task.y})")
+                    print(f"Robot {robot.id} bid {bid_value:.2f} for task at ({task.x}, {task.y})")
         
         if not all_bids:
-            print("No valid bids received")  # Debug print
+            print("No valid bids received")
             return
         
         # Sort bids by value (highest first)
@@ -229,37 +248,31 @@ class Game:
                 task not in assigned_tasks and 
                 task in self.grid.tasks):  # Ensure task still exists
                 
-                print(f"Assigning task at ({task.x}, {task.y}) to Robot {robot.id}")  # Debug print
+                print(f"Assigning task at ({task.x}, {task.y}) to Robot {robot.id}")
                 
                 # Assign task to robot
-                robot.set_target(task)
+                robot.target = task
                 task.assigned = True
                 self.grid.mark_task_assigned(task)
                 
-                # Update tracking
-                assigned_tasks.add(task)
-                assigned_robots.add(robot)
-                
-                # Update metrics
-                robot.last_task_start = current_time
-                
-                self.add_status_message(
-                    f"Robot {robot.id} assigned to task at ({task.x}, {task.y}) with bid {bid_value:.2f}"
-                )
-                
-                # Find initial path
+                # Find path to task
                 path = self.astar.find_path(
                     (robot.x, robot.y),
                     task.get_position(),
                     robot=robot
                 )
+                
                 if path:
-                    robot.path = path
-                    if len(path) > 1:
-                        robot.path.pop(0)  # Remove current position
-                    print(f"Found path of length {len(path)} for Robot {robot.id}")  # Debug print
+                    robot.path = path[1:]  # Skip current position
+                    print(f"Found path of length {len(path)} for Robot {robot.id}")
+                    
+                    # Update tracking
+                    assigned_tasks.add(task)
+                    assigned_robots.add(robot)
+                    robot.last_task_start = time.time()
                 else:
-                    print(f"No path found for Robot {robot.id}")  # Debug print
+                    print(f"No path found for Robot {robot.id}")
+                    robot.target = None
 
     def update_simulation(self):
         """Update simulation state"""
@@ -281,179 +294,107 @@ class Game:
         self.grid.update_moving_obstacles(current_time, MOVE_DELAY)
         
         # Update robot states
-        self._update_robots(current_time)
+        self._update_robots()
         
         # Run task allocation more frequently
         if current_time - self.last_auction_time >= self.auction_interval:
             self.auction_tasks()
 
-    def _update_robots(self, current_time):
-        """Update robot positions and states with improved movement handling"""
-        # Update waiting times
+    def _update_robots(self):
+        """Update robot positions and handle task completion"""
+        current_time = time.time()
+        
+        # First check for idle robots and assign tasks
+        idle_robots = [robot for robot in self.robots if not robot.target]
+        if idle_robots:
+            print(f"Found {len(idle_robots)} idle robots, running auction")
+            # Make sure there are available tasks
+            if self.grid.tasks:
+                self.auction_tasks()
+            else:
+                # Generate a new task if none available
+                if self.dynamic_tasks_enabled:
+                    task = self.grid.generate_random_task()
+                    if task:
+                        print(f"Generated new task for idle robots at ({task.x}, {task.y})")
+                        self.auction_tasks()
+        
+        # Then update robot movements
         for robot in self.robots:
-            robot.update_waiting(robot.waiting, current_time)
-        
-        # Sort robots by priority and efficiency
-        active_robots = [r for r in self.robots if r.target]
-        active_robots.sort(key=lambda r: (
-            r.target.priority if r.target else 0,
-            -r.waiting_time,
-            r.manhattan_distance((r.x, r.y), r.target.get_position()) if r.target else float('inf'),
-            -r.completed_tasks  # Give preference to more efficient robots
-        ), reverse=True)
-        
-        # Track reserved positions for this update cycle
-        reserved_positions = set()
-        moving_robots = set()
-        
-        # First pass: Check for task completion and update paths
-        for robot in active_robots:
-            # Check if robot has reached its target
-            if robot.target and (robot.x, robot.y) == robot.target.get_position():
-                self._complete_task(robot, current_time)
+            # Skip robots without targets
+            if not robot.target:
+                continue
+                
+            # If robot has no path, try to find one
+            if not robot.path:
+                path = self.astar.find_path(
+                    (robot.x, robot.y),
+                    robot.target.get_position(),
+                    robot=robot
+                )
+                if path and len(path) > 1:  # Make sure path has more than just current position
+                    print(f"Found path for Robot {robot.id} to target at ({robot.target.x}, {robot.target.y})")
+                    robot.path = path[1:]  # Skip current position
+                else:
+                    print(f"No valid path found for Robot {robot.id} to target")
+                    robot.target = None
+                    continue
+            
+            # Check if enough time has passed since last move
+            if current_time - robot.last_move_time < MOVE_DELAY:
                 continue
             
-            # Update path if needed
-            if not robot.path or not self.grid.is_valid_path(robot.path):
-                self._update_robot_path(robot, current_time, reserved_positions)
-        
-        # Second pass: Move robots
-        for robot in active_robots:
-            if robot.target and robot.path:
-                self._move_robot(robot, current_time, reserved_positions, moving_robots)
-
-    def _complete_task(self, robot, current_time):
-        """Handle task completion"""
-        completed_priority = robot.target.priority
-        
-        # Keep the robot's current position
-        robot_pos = (robot.x, robot.y)
-        
-        # Remove task from grid and tracking
-        self.grid.remove_task(robot.target)
-        
-        # Update robot state
-        robot.target = None
-        robot.path = []
-        robot.completed_tasks += 1
-        self.total_tasks_completed += 1
-        robot.waiting = False
-        robot.waiting_time = 0
-        robot.last_move_time = current_time
-        
-        # Ensure robot stays on the grid at its current position
-        self.grid.set_cell(robot_pos[0], robot_pos[1], CellType.ROBOT)
-        
-        # Update performance metrics
-        if hasattr(robot, 'last_task_start'):
-            completion_time = current_time - robot.last_task_start
-            self.madql.metrics['completion_times'].append(completion_time)
-        
-        self.add_status_message(
-            f"Robot {robot.id}: Completed P{completed_priority} task! Total: {robot.completed_tasks}"
-        )
-        print(f"Robot {robot.id} completed task and remains at position {robot_pos}")  # Debug print
-
-    def _update_robot_path(self, robot, current_time, reserved_positions):
-        """Update robot's path with collision avoidance"""
-        if not robot.target:
-            return
-        
-        # Get positions to avoid (only consider current robot positions)
-        blocked = {(r.x, r.y) for r in self.robots if r != robot}
-        
-        # Find new path
-        path = self.astar.find_path(
-            (robot.x, robot.y),
-            robot.target.get_position(),
-            blocked,
-            robot
-        )
-        
-        if path:
-            print(f"Found path for Robot {robot.id}: {path}")  # Debug print
-            robot.path = path
-            if len(path) > 1:  # Only remove current position if path has more than one point
-                robot.path.pop(0)
-            self.add_status_message(
-                f"Robot {robot.id}: Found path to P{robot.target.priority} task, length {len(path)}"
-            )
-        else:
-            print(f"No path found for Robot {robot.id} from ({robot.x}, {robot.y}) to {robot.target.get_position()}")  # Debug print
-            robot.waiting = True
-            robot.waiting_time += MOVE_DELAY
-            self.add_status_message(
-                f"Robot {robot.id}: Waiting for path to P{robot.target.priority} task"
-            )
-
-    def _move_robot(self, robot, current_time, reserved_positions, moving_robots):
-        """Handle robot movement with improved collision avoidance"""
-        if current_time - robot.last_move_time < MOVE_DELAY:
-            return
-        
-        if not robot.path:
-            return
-        
-        next_pos = robot.path[0]
-        print(f"Robot {robot.id} attempting to move to {next_pos}")  # Debug print
-        
-        # Check if next position is the target
-        is_target = robot.target and next_pos == robot.target.get_position()
-        
-        # Check if movement is safe
-        can_move = True
-        
-        # Don't move if another robot is already moving to this position
-        if next_pos in moving_robots and not is_target:
-            print(f"Robot {robot.id} waiting - position {next_pos} reserved by moving robot")  # Debug print
-            can_move = False
-        
-        # Don't move if position is reserved (unless it's the target)
-        if next_pos in reserved_positions and not is_target:
-            print(f"Robot {robot.id} waiting - position {next_pos} in reserved positions")  # Debug print
-            can_move = False
-        
-        # Check for potential collisions with other robots' paths
-        for other_robot in self.robots:
-            if other_robot != robot and other_robot.path:
-                if other_robot.path[0] == next_pos:
-                    # If other robot has higher priority, wait
-                    if (other_robot.target and other_robot.target.priority > robot.target.priority):
-                        print(f"Robot {robot.id} waiting - collision with higher priority Robot {other_robot.id}")  # Debug print
-                        can_move = False
-                        break
-        
-        # Try to move
-        if can_move:
-            # Get current cell type before moving
-            current_cell = self.grid.get_cell(robot.x, robot.y)
-            next_cell = self.grid.get_cell(*next_pos)
-            
-            print(f"Robot {robot.id} moving from ({robot.x}, {robot.y}) to {next_pos}")  # Debug print
-            print(f"Current cell: {current_cell}, Next cell: {next_cell}")  # Debug print
-            
-            if self.grid.move_robot(robot, *next_pos):
-                print(f"Robot {robot.id} moved successfully to {next_pos}")  # Debug print
-                moving_robots.add(next_pos)
-                reserved_positions.add(next_pos)
-                robot.path.pop(0)
-                robot.last_move_time = current_time
-                robot.total_distance += 1
-                robot.waiting = False
-                robot.waiting_time = 0
-            else:
-                print(f"Robot {robot.id} failed to move to {next_pos}")  # Debug print
-                robot.waiting = True
-                robot.waiting_time += MOVE_DELAY
-        else:
-            print(f"Robot {robot.id} cannot move - movement not safe")  # Debug print
-            robot.waiting = True
-            robot.waiting_time += MOVE_DELAY
-            
-            # If robot has been waiting too long, try to find alternative path
-            if robot.waiting_time > MOVE_DELAY * 5:
-                print(f"Robot {robot.id} waited too long, finding new path")  # Debug print
-                self._update_robot_path(robot, current_time, reserved_positions)
+            # Try to move along path
+            if robot.path:
+                next_pos = robot.path[0]
+                success = self.grid.move_robot(robot, next_pos[0], next_pos[1])
+                
+                if success:
+                    robot.last_move_time = current_time
+                    robot.x, robot.y = next_pos
+                    robot.path.pop(0)
+                    
+                    # Check if robot has reached a task
+                    cell = self.grid.get_cell(robot.x, robot.y)
+                    if cell in [CellType.TASK, CellType.TARGET]:
+                        completed_task = None
+                        for task in self.grid.tasks:
+                            if task.x == robot.x and task.y == robot.y:
+                                completed_task = task
+                                break
+                                
+                        if completed_task:
+                            # Remove the task
+                            self.grid.tasks.remove(completed_task)
+                            print(f"Robot {robot.id} completed task at ({completed_task.x}, {completed_task.y})")
+                            
+                            # Update robot's completion status
+                            robot.completed_tasks += 1
+                            self.total_tasks_completed += 1
+                            
+                            # Notify other robots if their target task was completed
+                            for other_robot in self.robots:
+                                if other_robot != robot and other_robot.target == completed_task:
+                                    print(f"Robot {other_robot.id}'s target task was completed by Robot {robot.id}")
+                                    other_robot.target = None
+                                    other_robot.path = []
+                            
+                            # Clear robot's target and path
+                            robot.target = None
+                            robot.path = []
+                            
+                            # Generate a new task if needed
+                            if len(self.grid.tasks) < MAX_TASKS and self.dynamic_tasks_enabled:
+                                task = self.grid.generate_random_task()
+                                if task:
+                                    print(f"Generated replacement task at ({task.x}, {task.y})")
+                            
+                            # Run auction for all robots without tasks
+                            self.auction_tasks()
+                else:
+                    # If move failed, clear path and try to find a new one next update
+                    print(f"Robot {robot.id} failed to move, clearing path")
+                    robot.path = []
 
     def run(self):
         """Main game loop"""
