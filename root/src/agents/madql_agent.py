@@ -10,14 +10,16 @@ class MADQLAgent:
     def __init__(self, game):
         self.game = game
         self.episode_count = 0
-        self.total_tasks_completed = 0  # Initialize total_tasks_completed
+        self.total_tasks_completed = 0
         self.learning_stats = {
             'episode_rewards': [],
             'q_value_history': [],
             'bid_history': [],
-            'task_distribution': {},  # Track task distribution among robots
-            'completion_times': [],   # Track task completion times
-            'congestion_levels': []   # Track congestion levels
+            'task_distribution': {},
+            'completion_times': [],
+            'congestion_levels': [],
+            'bid_success_rate': [],  # Track successful vs unsuccessful bids
+            'bid_values': []  # Track actual bid values chosen
         }
         
         # Initialize learned weights for different factors
@@ -30,22 +32,29 @@ class MADQLAgent:
         }
         
         # Experience prioritization parameters
-        self.priority_alpha = 0.6    # Priority exponent
-        self.priority_beta = 0.4     # Importance sampling weight
-        self.max_priority = 1.0      # Maximum priority
+        self.priority_alpha = 0.6
+        self.priority_beta = 0.4
+        self.max_priority = 1.0
+        
+        # Bid-specific parameters
+        self.bid_range = 10  # Number of discrete bid values
+        self.min_bid = 0.0
+        self.max_bid = 1.0
+        self.bid_increment = (self.max_bid - self.min_bid) / self.bid_range
         
         # Calculate state size with local and global components
         self.local_state_size = (
             2 +  # Robot position (x, y)
             4 * 9 +  # 3x3 grid around robot (4 features per cell)
-            5  # Local task features
+            5 +  # Local task features
+            3   # Bid-specific features (last bid, success rate, competition)
         )
         self.global_state_size = (
             3 +  # Global metrics (task count, avg priority, congestion)
             5 * (MAX_TASKS - 1)  # Other robots' compressed info
         )
         self.state_size = self.local_state_size + self.global_state_size
-        self.action_size = GRID_SIZE * GRID_SIZE
+        self.action_size = self.bid_range  # Action space now represents bid values
         
         # Initialize networks
         self.dqn = CentralizedDQN(
@@ -56,23 +65,22 @@ class MADQLAgent:
         
         self.prev_states = [None] * len(game.robots)
         self.prev_actions = [None] * len(game.robots)
+        self.prev_bids = {}  # Track previous bids for each robot
         
     def get_state(self, robot):
-        """Enhanced state representation with local and global features"""
+        """Enhanced state representation with bid-specific features"""
         robot_idx = self.game.robots.index(robot)
         state = []
         
-        # Local state components
-        # 1. Robot's position
+        # Local state components (existing code remains the same until local task features)
         state.extend([robot.x/GRID_SIZE, robot.y/GRID_SIZE])
         
-        # 2. 3x3 grid around robot
+        # 3x3 grid around robot
         for dy in [-1, 0, 1]:
             for dx in [-1, 0, 1]:
                 x, y = robot.x + dx, robot.y + dy
                 if 0 <= x < GRID_SIZE and 0 <= y < GRID_SIZE:
                     cell = self.game.grid[y][x]
-                    # Features: is_robot, is_obstacle, is_task, task_priority
                     state.extend([
                         1.0 if cell == CellType.ROBOT else 0.0,
                         1.0 if cell == CellType.OBSTACLE else 0.0,
@@ -80,9 +88,9 @@ class MADQLAgent:
                         self._get_cell_priority(x, y) / 3.0
                     ])
                 else:
-                    state.extend([0.0, 0.0, 0.0, 0.0])  # Out of bounds
+                    state.extend([0.0, 0.0, 0.0, 0.0])
         
-        # 3. Local task features
+        # Local task features
         nearest_task = self._find_nearest_task(robot)
         if nearest_task:
             state.extend([
@@ -97,15 +105,24 @@ class MADQLAgent:
         else:
             state.extend([0.0, 0.0, 0.0, 0.0, 0.0])
         
-        # Global state components
-        # 1. Global metrics
+        # Bid-specific features
+        last_bid = self.prev_bids.get(robot.id, 0.0)
+        bid_success_rate = self.get_bid_success_rate(robot)
+        competition_level = self.get_competition_level(robot)
+        state.extend([
+            last_bid / self.max_bid,
+            bid_success_rate,
+            competition_level
+        ])
+        
+        # Global state components (existing code)
         state.extend([
             len(self.game.tasks)/MAX_TASKS,
             sum(t.priority for t in self.game.tasks)/(3 * MAX_TASKS),
             self._calculate_global_congestion()/10.0
         ])
         
-        # 2. Compressed info about other robots
+        # Other robots' info (existing code)
         other_robots_info = []
         for i, other_robot in enumerate(self.game.robots):
             if i != robot_idx and len(other_robots_info) < 5 * (MAX_TASKS - 1):
@@ -125,6 +142,150 @@ class MADQLAgent:
         state.extend(other_robots_info)
         
         return np.array(state, dtype=np.float32)
+    
+    def get_bid_success_rate(self, robot):
+        """Calculate robot's bid success rate"""
+        if robot.id not in self.learning_stats['bid_success_rate']:
+            return 0.5  # Default to neutral value
+        history = self.learning_stats['bid_success_rate'][robot.id]
+        if not history:
+            return 0.5
+        return sum(history[-100:]) / len(history[-100:])  # Last 100 bids
+    
+    def get_competition_level(self, robot):
+        """Calculate competition level for tasks"""
+        if not self.game.tasks:
+            return 0.0
+        unassigned_robots = len([r for r in self.game.robots if not r.target])
+        return min(1.0, unassigned_robots / len(self.game.tasks))
+    
+    def calculate_bid(self, robot, available_tasks=None):
+        """Calculate bid using learned Q-values"""
+        if available_tasks is None:
+            available_tasks = self.get_available_tasks(robot)
+            
+        if not available_tasks:
+            return None, 0.0
+            
+        try:
+            # Get current state
+            state = self.get_state(robot)
+            
+            # Get Q-values for bid actions
+            q_values = self.dqn.get_q_values(state)
+            
+            # Use epsilon-greedy for bid selection
+            if random.random() < EPSILON:
+                bid_action = random.randrange(self.action_size)
+            else:
+                bid_action = torch.argmax(q_values).item()
+            
+            # Convert action to bid value
+            bid_value = self.min_bid + bid_action * self.bid_increment
+            
+            # Store bid for learning
+            self.prev_bids[robot.id] = bid_value
+            
+            # Choose task with highest priority * bid_value
+            chosen_task = max(available_tasks, 
+                            key=lambda t: t.priority * bid_value / (1 + robot.manhattan_distance((robot.x, robot.y), t.get_position())))
+            
+            # Track bid history
+            self.learning_stats['bid_history'].append(bid_value)
+            self.learning_stats['bid_values'].append(bid_value)
+            
+            return chosen_task, bid_value
+            
+        except Exception as e:
+            print(f"Warning: Error calculating bid: {e}")
+            import traceback
+            traceback.print_exc()
+            return None, 0.0
+    
+    def get_reward(self, robot, old_state, action, new_state):
+        """Enhanced reward function with bid-specific rewards"""
+        if action is None:
+            return -10
+        
+        reward = 0
+        robot_idx = self.game.robots.index(robot)
+        
+        # Get the bid value used
+        bid_value = self.prev_bids.get(robot.id, 0.0)
+        
+        if isinstance(action, Task):
+            # Base reward scaled by priority and urgency
+            waiting_time = action.get_waiting_time()
+            urgency_factor = min(waiting_time / 10.0, 2.0)
+            
+            # Bid efficiency reward
+            if robot.target == action:  # Successful bid
+                # Reward higher for winning with lower bid
+                bid_efficiency = 1.0 - (bid_value / self.max_bid)
+                reward += action.priority * 20 * urgency_factor * (1 + bid_efficiency)
+                
+                # Track successful bid
+                if robot.id not in self.learning_stats['bid_success_rate']:
+                    self.learning_stats['bid_success_rate'][robot.id] = []
+                self.learning_stats['bid_success_rate'][robot.id].append(1)
+            else:  # Unsuccessful bid
+                # Penalize high bids that didn't win
+                bid_penalty = bid_value / self.max_bid
+                reward -= 10 * bid_penalty
+                
+                # Track unsuccessful bid
+                if robot.id not in self.learning_stats['bid_success_rate']:
+                    self.learning_stats['bid_success_rate'][robot.id] = []
+                self.learning_stats['bid_success_rate'][robot.id].append(0)
+            
+            # Existing distance and congestion penalties
+            dist = robot.manhattan_distance((robot.x, robot.y), action.get_position())
+            reward -= dist * 2
+            
+            path = self.game.astar.find_path((robot.x, robot.y), action.get_position())
+            if path:
+                congestion = self._calculate_path_congestion(path)
+                reward -= congestion * 5
+                
+                # Team coordination consideration
+                path_conflicts = self._calculate_path_conflicts(robot, path)
+                reward -= path_conflicts * 10
+                
+                if len(path) < dist:
+                    reward += 5
+            else:
+                reward -= 50
+            
+            # Global efficiency rewards
+            if robot.target:
+                active_robots = len([r for r in self.game.robots if r.target])
+                team_factor = active_robots / len(self.game.robots)
+                reward += team_factor * 10
+            
+            # Completion rewards
+            if robot.target and robot.manhattan_distance((robot.x, robot.y), robot.target.get_position()) == 0:
+                reward += 100 * robot.target.priority
+                team_completion_rate = self.game.total_tasks_completed / max(1, time.time() - self.game.start_time)
+                reward += team_completion_rate * 20
+        
+        # Track reward
+        self.learning_stats['episode_rewards'].append(reward)
+        return reward
+    
+    def _calculate_path_conflicts(self, robot, path):
+        """Calculate number of path conflicts with other robots"""
+        conflicts = 0
+        for other_robot in self.game.robots:
+            if other_robot != robot and other_robot.target:
+                other_path = self.game.astar.find_path(
+                    (other_robot.x, other_robot.y),
+                    other_robot.target.get_position()
+                )
+                if other_path:
+                    path_set = set((x, y) for x, y in path)
+                    other_set = set((x, y) for x, y in other_path)
+                    conflicts += len(path_set.intersection(other_set))
+        return conflicts
     
     def _get_cell_priority(self, x, y):
         """Get priority of task at cell if it exists"""
@@ -153,71 +314,6 @@ class MADQLAgent:
                     congestion += self._calculate_path_congestion(path)
         return congestion / len(self.game.robots) if self.game.robots else 0
     
-    def calculate_bid(self, robot, available_tasks=None):
-        """Centralized method to calculate bids for tasks"""
-        if available_tasks is None:
-            available_tasks = self.get_available_tasks(robot)
-            
-        if not available_tasks:
-            return None, 0.0
-            
-        try:
-            # Get current state and Q-values
-            state = self.get_state(robot)
-            q_values = self.dqn.get_q_values(state)
-            
-            # Calculate bids for each task
-            bids = []
-            for task in available_tasks:
-                task_idx = task.y * GRID_SIZE + task.x
-                q_value = float(q_values[task_idx])
-                
-                # Get path and congestion information
-                distance = robot.manhattan_distance((robot.x, robot.y), task.get_position())
-                path = self.game.astar.find_path((robot.x, robot.y), task.get_position())
-                congestion = self._calculate_path_congestion(path) if path else float('inf')
-                
-                # Calculate normalized factors
-                factors = {
-                    'q_value': q_value / max(1e-6, q_values.max()),
-                    'priority': task.priority / 3.0,
-                    'distance': 1.0 - (distance / (2 * GRID_SIZE)),
-                    'congestion': 1.0 - (congestion / (len(path) if path else 1)),
-                    'waiting_time': min(task.get_waiting_time() / 10.0, 1.0)
-                }
-                
-                # Calculate weighted bid
-                bid_value = sum(self.factor_weights[k] * v for k, v in factors.items())
-                
-                # Apply fairness adjustment
-                completion_count = self.learning_stats['task_distribution'].get(robot.id, 0)
-                fairness_factor = 1.0 + (0.1 * (1.0 - completion_count / max(1, self.total_tasks_completed)))
-                bid_value *= fairness_factor
-                
-                bids.append((task, bid_value, factors))
-            
-            if not bids:
-                return None, 0.0
-                
-            # Track bid history
-            self.learning_stats['bid_history'].append(max(b[1] for b in bids))
-            
-            # Choose task with highest bid
-            chosen_task, bid_value, factors = max(bids, key=lambda x: x[1])
-            
-            # Update factor weights based on success/failure
-            if robot.id in self.learning_stats['task_distribution']:
-                success_rate = self.learning_stats['task_distribution'][robot.id] / max(1, self.episode_count)
-                self._update_factor_weights(factors, success_rate)
-            
-            return chosen_task, bid_value
-            
-        except Exception as e:
-            print(f"Warning: Error calculating bid: {e}")
-            import traceback
-            traceback.print_exc()
-            return None, 0.0
-            
     def choose_action(self, robot):
         """Enhanced action selection using centralized bidding"""
         # Check if number of robots has changed and reinitialize DQN if needed
@@ -358,79 +454,6 @@ class MADQLAgent:
         """Get list of available tasks that can be assigned"""
         return [task for task in self.game.tasks 
                 if self.game.grid[task.y][task.x].value == CellType.TASK.value]
-    
-    def get_reward(self, robot, old_state, action, new_state):
-        """Enhanced reward function with better learning signals"""
-        if action is None:
-            return -10
-        
-        reward = 0
-        robot_idx = self.game.robots.index(robot)
-        
-        # Individual rewards
-        if isinstance(action, Task):
-            # Base reward scaled by priority and urgency
-            waiting_time = action.get_waiting_time()
-            urgency_factor = min(waiting_time / 10.0, 2.0)  # Cap at 2x multiplier
-            reward += action.priority * 20 * urgency_factor
-            
-            # Distance and congestion consideration
-            dist = robot.manhattan_distance((robot.x, robot.y), action.get_position())
-            reward -= dist * 2  # Distance penalty
-            
-            path = self.game.astar.find_path((robot.x, robot.y), action.get_position())
-            if path:
-                # Path congestion
-                congestion = 0
-                for px, py in path:
-                    for dx, dy in [(0,1), (1,0), (0,-1), (-1,0)]:
-                        check_x, check_y = px + dx, py + dy
-                        if 0 <= check_x < GRID_SIZE and 0 <= check_y < GRID_SIZE:
-                            if self.game.grid[check_y][check_x] in [CellType.ROBOT, CellType.OBSTACLE]:
-                                congestion += 1
-                reward -= congestion * 5
-                
-                # Team coordination bonus
-                other_robots_paths = []
-                for other_robot in self.game.robots:
-                    if other_robot != robot and other_robot.target:
-                        other_path = self.game.astar.find_path(
-                            (other_robot.x, other_robot.y),
-                            other_robot.target.get_position()
-                        )
-                        if other_path:
-                            other_robots_paths.append(other_path)
-                
-                # Reward for choosing paths that don't interfere with others
-                path_conflicts = 0
-                for other_path in other_robots_paths:
-                    path_set = set((x, y) for x, y in path)
-                    other_set = set((x, y) for x, y in other_path)
-                    path_conflicts += len(path_set.intersection(other_set))
-                reward -= path_conflicts * 10
-                
-                # Reward for task completion progress
-                if len(path) < dist:  # If we're getting closer to the goal
-                    reward += 5
-            else:
-                reward -= 50  # Heavy penalty for unreachable tasks
-            
-            # Global efficiency consideration
-            if robot.target:
-                active_robots = len([r for r in self.game.robots if r.target])
-                team_factor = active_robots / len(self.game.robots)
-                reward += team_factor * 10
-            
-            # Completion bonus with team consideration
-            if robot.target and robot.manhattan_distance((robot.x, robot.y), robot.target.get_position()) == 0:
-                reward += 100 * robot.target.priority
-                # Extra bonus if team is performing well
-                team_completion_rate = self.game.total_tasks_completed / max(1, time.time() - self.game.start_time)
-                reward += team_completion_rate * 20
-        
-        # Track reward for this episode
-        self.learning_stats['episode_rewards'].append(reward)
-        return reward
     
     def _calculate_path_congestion(self, path):
         """Helper method to calculate path congestion"""
