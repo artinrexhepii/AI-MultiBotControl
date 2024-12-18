@@ -15,27 +15,31 @@ class DQN(nn.Module):
         self.local_net = nn.Sequential(
             nn.Linear(state_size // 2, 128),
             nn.ReLU(),
-            nn.BatchNorm1d(128),
             nn.Dropout(0.2),
-            nn.Linear(128, 64)
+            nn.Linear(128, 64),
+            nn.ReLU()
         )
         
         self.global_net = nn.Sequential(
             nn.Linear(state_size - (state_size // 2), 128),
             nn.ReLU(),
-            nn.BatchNorm1d(128),
             nn.Dropout(0.2),
-            nn.Linear(128, 64)
+            nn.Linear(128, 64),
+            nn.ReLU()
         )
         
         # Combine local and global features
         self.combine_net = nn.Sequential(
             nn.Linear(128, 128),
             nn.ReLU(),
-            nn.BatchNorm1d(128),
             nn.Dropout(0.2),
             nn.Linear(128, action_size)
         )
+        
+        # Layer normalization instead of batch normalization
+        self.local_norm = nn.LayerNorm(64)
+        self.global_norm = nn.LayerNorm(64)
+        self.combine_norm = nn.LayerNorm(128)
         
     def forward(self, x):
         # Split input into local and global components
@@ -47,8 +51,14 @@ class DQN(nn.Module):
         local_features = self.local_net(local_input)
         global_features = self.global_net(global_input)
         
+        # Apply layer normalization
+        local_features = self.local_norm(local_features)
+        global_features = self.global_norm(global_features)
+        
         # Combine features
         combined = torch.cat([local_features, global_features], dim=1)
+        combined = self.combine_norm(combined)
+        
         return self.combine_net(combined)
 
 class PrioritizedReplayBuffer:
@@ -108,6 +118,11 @@ class CentralizedDQN:
         self.learning_rate = 0.001
         self.tau = 0.001
         
+        # Initialize performance metrics
+        self.total_tasks_completed = 0
+        self.total_rewards = 0
+        self.episode_count = 0
+        
         # Initialize networks
         self.policy_nets = [DQN(state_size, action_size) for _ in range(num_agents)]
         self.target_nets = [DQN(state_size, action_size) for _ in range(num_agents)]
@@ -131,20 +146,18 @@ class CentralizedDQN:
             'epsilon_history': []
         }
         
-    def _initialize_networks(self):
-        """Initialize network weights properly"""
-        for net in self.policy_nets + self.target_nets + [self.critic_net]:
-            for layer in net.modules():
-                if isinstance(layer, nn.Linear):
-                    nn.init.kaiming_normal_(layer.weight)
-                    nn.init.constant_(layer.bias, 0)
-                elif isinstance(layer, nn.BatchNorm1d):
-                    nn.init.constant_(layer.weight, 1)
-                    nn.init.constant_(layer.bias, 0)
+        # Set networks to evaluation mode initially
+        self._set_eval_mode()
     
-    def remember(self, state, action, reward, next_state, priority):
-        """Store experience in prioritized replay buffer"""
-        self.memory.push(state, action, reward, next_state, priority)
+    def _set_eval_mode(self):
+        """Set all networks to evaluation mode"""
+        for net in self.policy_nets + self.target_nets + [self.critic_net]:
+            net.eval()
+    
+    def _set_train_mode(self):
+        """Set all networks to training mode"""
+        for net in self.policy_nets + self.target_nets + [self.critic_net]:
+            net.train()
     
     def train_step(self, beta):
         """Enhanced training step with prioritized experience replay"""
@@ -152,13 +165,22 @@ class CentralizedDQN:
             return
             
         try:
+            # Set networks to training mode
+            self._set_train_mode()
+            
             # Sample batch with importance sampling
             batch, weights, indices = self.memory.sample(self.batch_size, beta)
             if batch is None:
                 return
                 
             states, actions, rewards, next_states = batch
-            weights = torch.FloatTensor(weights)
+            
+            # Ensure proper tensor shapes
+            states = torch.FloatTensor(np.array(states))  # [batch_size, state_size]
+            next_states = torch.FloatTensor(np.array(next_states))  # [batch_size, state_size]
+            actions = torch.LongTensor(np.array(actions)).view(-1, 1)  # [batch_size, 1]
+            rewards = torch.FloatTensor(np.array(rewards)).view(-1, 1)  # [batch_size, 1]
+            weights = torch.FloatTensor(weights).view(-1, 1)  # [batch_size, 1]
             
             total_policy_loss = 0
             total_q_value = 0
@@ -166,66 +188,77 @@ class CentralizedDQN:
             
             # Train individual policy networks
             for i in range(self.num_agents):
-                # Current Q values
-                current_q = self.policy_nets[i](states)
-                current_q = current_q.gather(1, actions.unsqueeze(1))
-                
-                # Next Q values with Double DQN
-                with torch.no_grad():
-                    next_actions = self.policy_nets[i](next_states).max(1)[1].unsqueeze(1)
-                    next_q = self.target_nets[i](next_states)
-                    next_q = next_q.gather(1, next_actions)
-                
-                # Compute target Q values
-                target_q = rewards.unsqueeze(1) + self.gamma * next_q
-                
-                # Compute weighted Huber loss
-                loss = F.smooth_l1_loss(current_q, target_q, reduction='none')
-                weighted_loss = (loss * weights.unsqueeze(1)).mean()
-                
-                total_policy_loss += weighted_loss.item()
-                total_q_value += current_q.mean().item()
-                
-                # Store new priorities
-                new_priorities.extend(loss.detach().abs().cpu().numpy())
-                
-                # Optimize policy network
-                self.optimizers[i].zero_grad()
-                weighted_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.policy_nets[i].parameters(), 1.0)
-                self.optimizers[i].step()
-                
-                # Soft update target network
-                self.soft_update(self.target_nets[i], self.policy_nets[i])
+                try:
+                    # Current Q values
+                    current_q = self.policy_nets[i](states)  # [batch_size, action_size]
+                    current_q = current_q.gather(1, actions)  # [batch_size, 1]
+                    
+                    # Next Q values with Double DQN
+                    with torch.no_grad():
+                        next_q_policy = self.policy_nets[i](next_states)  # [batch_size, action_size]
+                        next_actions = next_q_policy.max(1)[1].view(-1, 1)  # [batch_size, 1]
+                        next_q = self.target_nets[i](next_states)  # [batch_size, action_size]
+                        next_q = next_q.gather(1, next_actions)  # [batch_size, 1]
+                    
+                    # Compute target Q values
+                    target_q = rewards + self.gamma * next_q  # [batch_size, 1]
+                    
+                    # Compute weighted Huber loss
+                    loss = F.smooth_l1_loss(current_q, target_q, reduction='none')  # [batch_size, 1]
+                    weighted_loss = (loss * weights).mean()
+                    
+                    total_policy_loss += weighted_loss.item()
+                    total_q_value += current_q.mean().item()
+                    
+                    # Store new priorities
+                    new_priorities.extend(loss.detach().cpu().numpy().flatten())
+                    
+                    # Optimize policy network
+                    self.optimizers[i].zero_grad()
+                    weighted_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.policy_nets[i].parameters(), 1.0)
+                    self.optimizers[i].step()
+                    
+                    # Soft update target network
+                    self.soft_update(self.target_nets[i], self.policy_nets[i])
+                except Exception as e:
+                    print(f"Warning: Error training policy network {i}: {e}")
+                    continue
             
             # Update priorities in replay buffer
-            self.memory.update_priorities(indices, new_priorities)
+            if new_priorities:
+                self.memory.update_priorities(indices, np.array(new_priorities))
             
-            # Train centralized critic
-            critic_q = self.critic_net(states)
-            critic_q = critic_q.gather(1, actions.sum(1, keepdim=True))
-            
-            with torch.no_grad():
-                next_critic_q = self.critic_net(next_states)
-                next_critic_actions = next_critic_q.max(1)[1].unsqueeze(1)
-                next_critic_value = next_critic_q.gather(1, next_critic_actions)
-                critic_target = rewards.sum(1, keepdim=True) + \
-                               self.gamma * next_critic_value
-            
-            # Compute weighted critic loss
-            critic_loss = F.smooth_l1_loss(critic_q, critic_target, reduction='none')
-            weighted_critic_loss = (critic_loss * weights.unsqueeze(1)).mean()
-            
-            # Update critic
-            self.critic_optimizer.zero_grad()
-            weighted_critic_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.critic_net.parameters(), 1.0)
-            self.critic_optimizer.step()
+            try:
+                # Train centralized critic
+                critic_q = self.critic_net(states)  # [batch_size, action_size]
+                critic_q = critic_q.gather(1, actions)  # [batch_size, 1]
+                
+                with torch.no_grad():
+                    next_critic_q = self.critic_net(next_states)  # [batch_size, action_size]
+                    next_critic_actions = next_critic_q.max(1)[1].view(-1, 1)  # [batch_size, 1]
+                    next_critic_value = next_critic_q.gather(1, next_critic_actions)  # [batch_size, 1]
+                    critic_target = rewards + self.gamma * next_critic_value  # [batch_size, 1]
+                
+                # Compute weighted critic loss
+                critic_loss = F.smooth_l1_loss(critic_q, critic_target, reduction='none')  # [batch_size, 1]
+                weighted_critic_loss = (critic_loss * weights).mean()
+                
+                # Update critic
+                self.critic_optimizer.zero_grad()
+                weighted_critic_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.critic_net.parameters(), 1.0)
+                self.critic_optimizer.step()
+                
+                # Update statistics
+                self.training_stats['critic_losses'].append(weighted_critic_loss.item())
+            except Exception as e:
+                print(f"Warning: Error training critic network: {e}")
             
             # Update statistics
-            self.training_stats['policy_losses'].append(total_policy_loss / self.num_agents)
-            self.training_stats['critic_losses'].append(weighted_critic_loss.item())
-            self.training_stats['avg_q_values'].append(total_q_value / self.num_agents)
+            if total_policy_loss > 0:
+                self.training_stats['policy_losses'].append(total_policy_loss / self.num_agents)
+                self.training_stats['avg_q_values'].append(total_q_value / self.num_agents)
             
             # Decay epsilon
             if self.epsilon > self.epsilon_min:
@@ -234,12 +267,30 @@ class CentralizedDQN:
             
         except Exception as e:
             print(f"Warning: Error during training step: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # Set networks back to evaluation mode
+            self._set_eval_mode()
     
     def get_q_values(self, state):
         """Get Q-values for all actions given a state"""
-        with torch.no_grad():
-            state_tensor = torch.FloatTensor(state).unsqueeze(0)
-            return self.policy_nets[0](state_tensor).squeeze()
+        try:
+            with torch.no_grad():
+                # Ensure state is a 2D tensor [batch_size, state_size]
+                if isinstance(state, np.ndarray):
+                    state = torch.FloatTensor(state)
+                if state.dim() == 1:
+                    state = state.unsqueeze(0)
+                
+                # Get Q-values and ensure output is 1D
+                q_values = self.policy_nets[0](state)
+                if q_values.dim() == 2 and q_values.size(0) == 1:
+                    q_values = q_values.squeeze(0)
+                return q_values
+        except Exception as e:
+            print(f"Warning: Error getting Q-values: {e}")
+            return torch.zeros(self.action_size)
     
     def soft_update(self, target_net, policy_net):
         """Soft update model parameters"""
@@ -282,49 +333,80 @@ class CentralizedDQN:
     
     def get_state_tensor(self, game, robot_idx):
         """Convert game state to tensor for a specific robot"""
-        robot = game.robots[robot_idx]
-        state = []
-        
-        # Robot's normalized position
-        state.extend([robot.x/GRID_SIZE, robot.y/GRID_SIZE])
-        
-        # Other robots' positions and targets
-        for i, other_robot in enumerate(game.robots):
-            if i != robot_idx:
-                state.extend([
-                    other_robot.x/GRID_SIZE,
-                    other_robot.y/GRID_SIZE
-                ])
-                if other_robot.target:
+        try:
+            robot = game.robots[robot_idx]
+            state = []
+            
+            # Robot's normalized position
+            state.extend([float(robot.x)/GRID_SIZE, float(robot.y)/GRID_SIZE])
+            
+            # Other robots' positions and targets
+            for i, other_robot in enumerate(game.robots):
+                if i != robot_idx:
                     state.extend([
-                        other_robot.target.x/GRID_SIZE,
-                        other_robot.target.y/GRID_SIZE,
-                        other_robot.target.priority/3
+                        float(other_robot.x)/GRID_SIZE,
+                        float(other_robot.y)/GRID_SIZE
                     ])
-                else:
-                    state.extend([0, 0, 0])
-        
-        # Available tasks information
-        task_info = np.zeros(GRID_SIZE * GRID_SIZE * 4)  # x, y, priority, waiting_time
-        for task in game.tasks:
-            idx = (task.y * GRID_SIZE + task.x) * 4
-            task_info[idx:idx+4] = [
-                task.x/GRID_SIZE,
-                task.y/GRID_SIZE,
-                task.priority/3,
-                min(task.get_waiting_time()/10.0, 1.0)
-            ]
-        state.extend(task_info)
-        
-        # Obstacle information
-        obstacle_info = np.zeros(GRID_SIZE * GRID_SIZE)
-        for y in range(GRID_SIZE):
-            for x in range(GRID_SIZE):
-                if game.grid[y][x] == CellType.OBSTACLE:
-                    obstacle_info[y * GRID_SIZE + x] = 1
-        state.extend(obstacle_info)
-        
-        return torch.FloatTensor(state)
+                    if other_robot.target:
+                        try:
+                            state.extend([
+                                float(other_robot.target.x)/GRID_SIZE,
+                                float(other_robot.target.y)/GRID_SIZE,
+                                float(other_robot.target.priority)/3.0
+                            ])
+                        except (AttributeError, TypeError, ValueError) as e:
+                            print(f"Warning: Error processing robot target: {e}")
+                            state.extend([0.0, 0.0, 0.0])
+                    else:
+                        state.extend([0.0, 0.0, 0.0])
+            
+            # Available tasks information
+            task_info = np.zeros(GRID_SIZE * GRID_SIZE * 4, dtype=np.float32)  # x, y, priority, waiting_time
+            for task in game.tasks:
+                try:
+                    x = int(float(task.x))
+                    y = int(float(task.y))
+                    priority = float(task.priority)
+                    waiting_time = float(task.get_waiting_time())
+                    
+                    idx = (y * GRID_SIZE + x) * 4
+                    if 0 <= idx < len(task_info) - 3:  # Ensure we have space for all 4 values
+                        task_info[idx:idx+4] = [
+                            float(x)/GRID_SIZE,
+                            float(y)/GRID_SIZE,
+                            priority/3.0,
+                            min(waiting_time/10.0, 1.0)
+                        ]
+                except (AttributeError, TypeError, ValueError, IndexError) as e:
+                    print(f"Warning: Error processing task in state tensor: {e}")
+                    continue
+            
+            state.extend(task_info.tolist())
+            
+            # Obstacle information
+            obstacle_info = np.zeros(GRID_SIZE * GRID_SIZE, dtype=np.float32)
+            for y in range(GRID_SIZE):
+                for x in range(GRID_SIZE):
+                    if game.grid[y][x] == CellType.OBSTACLE:
+                        idx = y * GRID_SIZE + x
+                        if 0 <= idx < len(obstacle_info):
+                            obstacle_info[idx] = 1.0
+            
+            state.extend(obstacle_info.tolist())
+            
+            # Convert to tensor and ensure correct shape
+            state_tensor = torch.FloatTensor(state)
+            if state_tensor.dim() == 0:
+                state_tensor = state_tensor.unsqueeze(0)
+            
+            return state_tensor
+            
+        except Exception as e:
+            print(f"Warning: Error creating state tensor: {e}")
+            import traceback
+            traceback.print_exc()  # Print the full stack trace for debugging
+            # Return a zero tensor of the correct size as fallback
+            return torch.zeros(self.state_size)
     
     def save(self, path):
         """Save models"""
@@ -345,3 +427,35 @@ class CentralizedDQN:
             self.target_nets[i].load_state_dict(state_dict)
         self.critic_net.load_state_dict(checkpoint['critic_net'])
         self.epsilon = checkpoint['epsilon'] 
+    
+    def _initialize_networks(self):
+        """Initialize network weights properly"""
+        for net in self.policy_nets + self.target_nets + [self.critic_net]:
+            for layer in net.modules():
+                if isinstance(layer, nn.Linear):
+                    nn.init.kaiming_normal_(layer.weight)
+                    nn.init.constant_(layer.bias, 0)
+                elif isinstance(layer, nn.LayerNorm):
+                    nn.init.constant_(layer.weight, 1)
+                    nn.init.constant_(layer.bias, 0)
+
+    def remember(self, state, action, reward, next_state, priority):
+        """Store experience in memory"""
+        try:
+            # Convert action to index if it's a Task object
+            if hasattr(action, 'x') and hasattr(action, 'y'):
+                action_idx = action.y * GRID_SIZE + action.x
+            else:
+                action_idx = int(action)  # Ensure action is an integer
+            
+            # Ensure state and next_state are numpy arrays
+            if isinstance(state, torch.Tensor):
+                state = state.cpu().numpy()
+            if isinstance(next_state, torch.Tensor):
+                next_state = next_state.cpu().numpy()
+            
+            self.memory.push(state, action_idx, reward, next_state, priority)
+        except Exception as e:
+            print(f"Warning: Error storing experience: {e}")
+            import traceback
+            traceback.print_exc()

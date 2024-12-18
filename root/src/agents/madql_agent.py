@@ -10,6 +10,7 @@ class MADQLAgent:
     def __init__(self, game):
         self.game = game
         self.episode_count = 0
+        self.total_tasks_completed = 0  # Initialize total_tasks_completed
         self.learning_stats = {
             'episode_rewards': [],
             'q_value_history': [],
@@ -267,16 +268,48 @@ class MADQLAgent:
             return  # Skip this update as we've reinitialized
         
         try:
+            # Convert action to index if it's a Task object
+            if isinstance(action, Task):
+                action_idx = int(action.y * GRID_SIZE + action.x)
+            elif isinstance(action, tuple):
+                x, y = action
+                action_idx = int(y * GRID_SIZE + x)
+            else:
+                action_idx = int(action)
+                
             # Calculate TD error for prioritization
             with torch.no_grad():
-                current_q = self.dqn.get_q_values(old_state)[action]
-                next_q = self.dqn.get_q_values(new_state).max()
-                td_error = abs(reward + self.dqn.gamma * next_q - current_q)
+                # Get Q-values for current state and ensure it's a tensor
+                current_q = self.dqn.get_q_values(old_state)
+                if not isinstance(current_q, torch.Tensor):
+                    current_q = torch.tensor(current_q)
+                
+                # Ensure action_idx is within bounds and is an integer
+                max_idx = current_q.numel() - 1
+                action_idx = max(0, min(action_idx, max_idx))
+                
+                # Get Q-value for the action taken
+                try:
+                    current_q_value = float(current_q[action_idx])
+                except Exception as e:
+                    print(f"Warning: Error accessing Q-value: {e}")
+                    print(f"current_q shape: {current_q.shape}, action_idx: {action_idx}")
+                    current_q_value = 0.0
+                
+                # Get max Q-value for next state
+                next_q = self.dqn.get_q_values(new_state)
+                if not isinstance(next_q, torch.Tensor):
+                    next_q = torch.tensor(next_q)
+                next_q_value = float(next_q.max())
+                
+                # Calculate TD error
+                td_error = abs(reward + self.dqn.gamma * next_q_value - current_q_value)
             
             # Update task distribution statistics
-            if action == robot.target:
+            if isinstance(action, Task) and robot.target == action:
                 self.learning_stats['task_distribution'][robot.id] = \
                     self.learning_stats['task_distribution'].get(robot.id, 0) + 1
+                self.total_tasks_completed += 1  # Increment total_tasks_completed
                 
                 # Track completion time
                 if hasattr(robot, 'last_task_start'):
@@ -285,7 +318,7 @@ class MADQLAgent:
             
             # Store experience with priority
             priority = min((td_error + 1e-6) ** self.priority_alpha, self.max_priority)
-            self.dqn.remember(old_state, action, reward, new_state, priority)
+            self.dqn.remember(old_state, action_idx, reward, new_state, priority)
             
             # Train the network
             self.dqn.train_step(self.priority_beta)
@@ -299,7 +332,9 @@ class MADQLAgent:
                     
         except Exception as e:
             print(f"Warning: Error during update: {e}")
-            
+            import traceback
+            traceback.print_exc()  # Print full stack trace for debugging
+    
     def get_available_tasks(self, robot):
         """Get list of available tasks that can be assigned"""
         return [task for task in self.game.tasks 
