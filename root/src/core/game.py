@@ -325,26 +325,30 @@ class Game:
             -r.waiting_time,  # Negative so longer waiting time gets priority
             r.manhattan_distance((r.x, r.y), r.target.get_position()) if r.target else float('inf')
         ), reverse=True)
-            
+        
+        # Track reserved positions to prevent multiple robots moving to the same spot
+        reserved_positions = set()
+        
         # Process all robots, not just active ones
         for robot in active_robots:
             if current_time - robot.last_move_time < MOVE_DELAY:
                 continue  # Skip if not enough time has passed since last move
-                
+            
             # Check if path is still valid
             if robot.path:
                 path_invalid = False
                 for pos in robot.path:
-                    if self.grid[pos[1]][pos[0]] == CellType.OBSTACLE:
+                    if (self.grid[pos[1]][pos[0]] == CellType.OBSTACLE or
+                        pos in reserved_positions):  # Check reserved positions
                         path_invalid = True
                         break
                 if path_invalid:
                     robot.path = []
-                    self.add_status_message(f"Robot {robot.id}: Replanning due to obstacle")
+                    self.add_status_message(f"Robot {robot.id}: Replanning due to obstacle or reserved position")
 
             if not robot.path:
                 if robot.target:
-                    # Consider other robots' positions and planned paths when finding a path
+                    # Consider other robots' positions, planned paths, and reserved positions
                     blocked_positions = set()
                     for other_robot in self.robots:
                         if other_robot != robot:
@@ -353,35 +357,46 @@ class Game:
                             # Add next planned position if any
                             if other_robot.path and len(other_robot.path) > 0:
                                 blocked_positions.add(other_robot.path[0])
+                    # Add reserved positions
+                    blocked_positions.update(reserved_positions)
                     
+                    # Try to find path avoiding blocked positions
                     robot.path = self.astar.find_path(
                         (robot.x, robot.y),
                         robot.target.get_position(),
                         blocked_positions
                     )
+                    
                     if robot.path:
                         path_length = len(robot.path)
                         self.add_status_message(
                             f"Robot {robot.id}: Found path to P{robot.target.priority} task, length {path_length}"
                         )
                     else:
+                        # If no path found, wait and accumulate priority
+                        robot.waiting = True
+                        robot.waiting_time += MOVE_DELAY
                         self.add_status_message(
-                            f"Robot {robot.id}: No path to P{robot.target.priority} task"
+                            f"Robot {robot.id}: Waiting for path to P{robot.target.priority} task"
                         )
-                        # If no path found, clear target and try another task
-                        robot.target = None
                         continue
                     robot.path.pop(0)  # Remove current position
-
+                    
             if robot.path:
                 next_pos = robot.path[0]
+                
+                # Check if next position is already reserved
+                if next_pos in reserved_positions:
+                    robot.waiting = True
+                    robot.waiting_time += MOVE_DELAY
+                    continue
                 
                 # Check for potential deadlock
                 deadlock = False
                 deadlock_robot = None
                 for other_robot in self.robots:
                     if other_robot != robot:
-                        # Check if robots are facing each other
+                        # Check if robots are trying to swap positions
                         if (other_robot.path and 
                             other_robot.path[0] == (robot.x, robot.y) and 
                             next_pos == (other_robot.x, other_robot.y)):
@@ -403,17 +418,10 @@ class Game:
                                         deadlock = True
                                         deadlock_robot = other_robot
                                         break
-                                    elif robot.waiting_time == other_robot.waiting_time:
-                                        # If same waiting time, let robot closer to target proceed
-                                        if (other_robot.target and
-                                            other_robot.manhattan_distance((other_robot.x, other_robot.y), other_robot.target.get_position()) < 
-                                            robot.manhattan_distance((robot.x, robot.y), robot.target.get_position())):
-                                            deadlock = True
-                                            deadlock_robot = other_robot
-                                            break
-
+                
                 if deadlock:
                     robot.waiting = True
+                    robot.waiting_time += MOVE_DELAY
                     if deadlock_robot:
                         # If both robots have been waiting too long, force one to find alternative path
                         if (robot.waiting and deadlock_robot.waiting and 
@@ -431,6 +439,9 @@ class Game:
                                     f"Robot {robot.id}: Breaking deadlock, waited too long"
                                 )
                 else:
+                    # Reserve the next position
+                    reserved_positions.add(next_pos)
+                    
                     # Get old state before moving
                     old_state = self.madql.get_state(robot)
                     
@@ -443,6 +454,7 @@ class Game:
                     robot.last_move_time = current_time
                     robot.total_distance += 1
                     robot.waiting = False
+                    robot.waiting_time = 0  # Reset waiting time after successful move
                     
                     # Get new state and update Q-values
                     new_state = self.madql.get_state(robot)
