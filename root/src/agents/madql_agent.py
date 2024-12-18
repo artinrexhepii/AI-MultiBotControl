@@ -56,12 +56,34 @@ class MADQLAgent:
         self.state_size = self.local_state_size + self.global_state_size
         self.action_size = self.bid_range  # Action space now represents bid values
         
-        # Initialize networks
+        # Agent pool management
+        self.max_pool_size = MAX_TASKS * 2  # Maximum number of potential agents
+        self.active_agents = set()  # Currently active agent indices
+        self.agent_pool = {}  # Pool of agent networks
+        self.agent_stats = {}  # Track statistics per agent
+        
+        # Initialize agent pool
         self.dqn = CentralizedDQN(
             state_size=self.state_size,
             action_size=self.action_size,
-            num_agents=len(game.robots)
+            num_agents=self.max_pool_size  # Initialize with maximum possible agents
         )
+        
+        # Initialize tracking for all potential agents
+        for i in range(self.max_pool_size):
+            self.agent_stats[i] = {
+                'last_active': None,
+                'total_tasks': 0,
+                'avg_reward': 0.0,
+                'experience_count': 0
+            }
+        
+        # Initialize active agents based on current robots
+        self._update_active_agents()
+        
+        # Maintain experience buffers per agent
+        self.agent_experiences = {i: [] for i in range(self.max_pool_size)}
+        self.max_experiences_per_agent = 10000
         
         self.prev_states = [None] * len(game.robots)
         self.prev_actions = [None] * len(game.robots)
@@ -348,34 +370,24 @@ class MADQLAgent:
         return congestion / len(self.game.robots) if self.game.robots else 0
     
     def choose_action(self, robot):
-        """Enhanced action selection using centralized bidding"""
-        # Check if number of robots has changed and reinitialize DQN if needed
-        if len(self.game.robots) != self.dqn.num_agents:
-            print(f"Reinitializing DQN for {len(self.game.robots)} agents")
-            self.dqn = CentralizedDQN(
-                state_size=self.state_size,
-                action_size=self.action_size,
-                num_agents=len(self.game.robots)
-            )
-            self.prev_states = [None] * len(self.game.robots)
-            self.prev_actions = [None] * len(self.game.robots)
+        """Enhanced action selection with dynamic agent handling"""
+        # Ensure robot's agent is active
+        if robot.id not in self.active_agents:
+            self._update_active_agents()
         
         # Get available tasks
         available_tasks = self.get_available_tasks(robot)
         if not available_tasks:
             return None
-            
+        
         try:
             # Use centralized bidding
             chosen_task, _ = self.calculate_bid(robot, available_tasks)
             
             if chosen_task:
-                robot_idx = self.game.robots.index(robot)
                 action_idx = chosen_task.y * GRID_SIZE + chosen_task.x
-                
-                # Store state and action
-                self.prev_states[robot_idx] = self.get_state(robot)
-                self.prev_actions[robot_idx] = action_idx
+                self.prev_states[robot.id] = self.get_state(robot)
+                self.prev_actions[robot.id] = action_idx
             
             return chosen_task
             
@@ -400,20 +412,12 @@ class MADQLAgent:
                 self.factor_weights[k] /= total
     
     def update(self, robot, old_state, action, reward, new_state):
-        """Enhanced update with prioritized experience replay"""
-        robot_idx = self.game.robots.index(robot)
+        """Enhanced update handling dynamic agents"""
+        robot_idx = robot.id
         
-        # Check if number of robots has changed and reinitialize DQN if needed
-        if len(self.game.robots) != self.dqn.num_agents:
-            print(f"Reinitializing DQN for {len(self.game.robots)} agents")
-            self.dqn = CentralizedDQN(
-                state_size=self.state_size,
-                action_size=self.action_size,
-                num_agents=len(self.game.robots)
-            )
-            self.prev_states = [None] * len(self.game.robots)
-            self.prev_actions = [None] * len(self.game.robots)
-            return  # Skip this update as we've reinitialized
+        # Ensure robot's agent is active
+        if robot_idx not in self.active_agents:
+            self._update_active_agents()
         
         try:
             # Convert action to index if it's a Task object
@@ -424,65 +428,106 @@ class MADQLAgent:
                 action_idx = int(y * GRID_SIZE + x)
             else:
                 action_idx = int(action)
-                
+            
             # Calculate TD error for prioritization
             with torch.no_grad():
-                # Get Q-values for current state and ensure it's a tensor
                 current_q = self.dqn.get_q_values(old_state)
                 if not isinstance(current_q, torch.Tensor):
                     current_q = torch.tensor(current_q)
                 
-                # Ensure action_idx is within bounds and is an integer
                 max_idx = current_q.numel() - 1
                 action_idx = max(0, min(action_idx, max_idx))
                 
-                # Get Q-value for the action taken
                 try:
                     current_q_value = float(current_q[action_idx])
                 except Exception as e:
                     print(f"Warning: Error accessing Q-value: {e}")
-                    print(f"current_q shape: {current_q.shape}, action_idx: {action_idx}")
                     current_q_value = 0.0
                 
-                # Get max Q-value for next state
                 next_q = self.dqn.get_q_values(new_state)
                 if not isinstance(next_q, torch.Tensor):
                     next_q = torch.tensor(next_q)
                 next_q_value = float(next_q.max())
                 
-                # Calculate TD error
                 td_error = abs(reward + self.dqn.gamma * next_q_value - current_q_value)
             
-            # Update task distribution statistics
-            if isinstance(action, Task) and robot.target == action:
-                self.learning_stats['task_distribution'][robot.id] = \
-                    self.learning_stats['task_distribution'].get(robot.id, 0) + 1
-                self.total_tasks_completed += 1  # Increment total_tasks_completed
-                
-                # Track completion time
-                if hasattr(robot, 'last_task_start'):
-                    completion_time = time.time() - robot.last_task_start
-                    self.learning_stats['completion_times'].append(completion_time)
+            # Store experience for the specific agent
+            experience = (old_state, action_idx, reward, new_state)
+            self.agent_experiences[robot_idx].append(experience)
+            
+            # Limit experience buffer size
+            if len(self.agent_experiences[robot_idx]) > self.max_experiences_per_agent:
+                self.agent_experiences[robot_idx].pop(0)
+            
+            # Update agent statistics
+            self.agent_stats[robot_idx]['experience_count'] += 1
+            self.agent_stats[robot_idx]['avg_reward'] = (
+                self.agent_stats[robot_idx]['avg_reward'] * 0.95 + reward * 0.05
+            )
             
             # Store experience with priority
             priority = min((td_error + 1e-6) ** self.priority_alpha, self.max_priority)
             self.dqn.remember(old_state, action_idx, reward, new_state, priority)
             
-            # Train the network
-            self.dqn.train_step(self.priority_beta)
+            # Update task statistics if applicable
+            if isinstance(action, Task) and robot.target == action:
+                self.agent_stats[robot_idx]['total_tasks'] += 1
+                self.total_tasks_completed += 1
+                
+                if hasattr(robot, 'last_task_start'):
+                    completion_time = time.time() - robot.last_task_start
+                    self.learning_stats['completion_times'].append(completion_time)
             
-            # Update statistics
+            # Train the network focusing on active agents
+            self._train_active_agents()
+            
+            # Update learning statistics
             self.learning_stats['episode_rewards'].append(reward)
             if hasattr(self.dqn, 'get_training_stats'):
                 training_stats = self.dqn.get_training_stats()
                 if training_stats:
                     self.learning_stats.update(training_stats)
-                    
+            
         except Exception as e:
             print(f"Warning: Error during update: {e}")
             import traceback
-            traceback.print_exc()  # Print full stack trace for debugging
-    
+            traceback.print_exc()
+
+    def _train_active_agents(self):
+        """Train the network focusing on active agents"""
+        # Only train if we have enough experiences
+        if not self.active_agents:
+            return
+        
+        try:
+            # Prioritize experiences from active agents
+            active_experiences = []
+            for agent_id in self.active_agents:
+                if agent_id in self.agent_experiences:
+                    active_experiences.extend(self.agent_experiences[agent_id][-100:])
+            
+            if active_experiences:
+                # Sample and train on experiences
+                sample_size = min(32, len(active_experiences))
+                batch = random.sample(active_experiences, sample_size)
+                
+                # Unzip the batch
+                states, actions, rewards, next_states = zip(*batch)
+                
+                # Convert to tensors
+                states = torch.FloatTensor(np.array(states))
+                actions = torch.LongTensor(np.array(actions))
+                rewards = torch.FloatTensor(np.array(rewards))
+                next_states = torch.FloatTensor(np.array(next_states))
+                
+                # Train the network
+                self.dqn.train_step(self.priority_beta)
+        
+        except Exception as e:
+            print(f"Warning: Error during training: {e}")
+            import traceback
+            traceback.print_exc()
+
     def get_available_tasks(self, robot):
         """Get list of available tasks that can be assigned"""
         return [task for task in self.game.tasks 
@@ -695,3 +740,49 @@ class MADQLAgent:
         
         # Choose task with highest score
         return max(task_scores, key=lambda x: x[1])[0]
+
+    def _update_active_agents(self):
+        """Update the set of active agents based on current robots"""
+        current_robot_ids = {robot.id for robot in self.game.robots}
+        
+        # Deactivate agents for removed robots
+        agents_to_deactivate = self.active_agents - current_robot_ids
+        for agent_id in agents_to_deactivate:
+            self.agent_stats[agent_id]['last_active'] = time.time()
+            self._preserve_agent_experience(agent_id)
+        
+        # Activate agents for new robots
+        for robot_id in current_robot_ids:
+            if robot_id not in self.active_agents:
+                self._activate_agent(robot_id)
+        
+        self.active_agents = current_robot_ids
+
+    def _activate_agent(self, agent_id):
+        """Activate an agent, potentially reusing previous experience"""
+        if agent_id < self.max_pool_size:
+            # If agent was previously active, restore its experience
+            if self.agent_stats[agent_id]['last_active'] is not None:
+                self._restore_agent_experience(agent_id)
+            
+            self.agent_stats[agent_id]['last_active'] = time.time()
+            self.active_agents.add(agent_id)
+
+    def _preserve_agent_experience(self, agent_id):
+        """Preserve important experiences when deactivating an agent"""
+        if agent_id in self.agent_experiences:
+            # Sort experiences by absolute reward
+            sorted_exp = sorted(self.agent_experiences[agent_id], 
+                              key=lambda x: abs(x[2]),  # x[2] is the reward
+                              reverse=True)
+            
+            # Keep top experiences
+            keep_count = min(1000, len(sorted_exp))
+            self.agent_experiences[agent_id] = sorted_exp[:keep_count]
+
+    def _restore_agent_experience(self, agent_id):
+        """Restore preserved experiences when reactivating an agent"""
+        if agent_id in self.agent_experiences and self.agent_experiences[agent_id]:
+            # Gradually reintroduce experiences to the DQN
+            for exp in self.agent_experiences[agent_id]:
+                self.dqn.remember(*exp, priority=1.0)
