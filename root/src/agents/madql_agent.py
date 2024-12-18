@@ -153,34 +153,20 @@ class MADQLAgent:
                     congestion += self._calculate_path_congestion(path)
         return congestion / len(self.game.robots) if self.game.robots else 0
     
-    def choose_action(self, robot):
-        """Enhanced action selection with integrated learning and heuristics"""
-        # Check if number of robots has changed and reinitialize DQN if needed
-        if len(self.game.robots) != self.dqn.num_agents:
-            print(f"Reinitializing DQN for {len(self.game.robots)} agents")
-            self.dqn = CentralizedDQN(
-                state_size=self.state_size,
-                action_size=self.action_size,
-                num_agents=len(self.game.robots)
-            )
-            self.prev_states = [None] * len(self.game.robots)
-            self.prev_actions = [None] * len(self.game.robots)
-        
-        # Get available tasks first, outside the try block
-        available_tasks = self.get_available_tasks(robot)
+    def calculate_bid(self, robot, available_tasks=None):
+        """Centralized method to calculate bids for tasks"""
+        if available_tasks is None:
+            available_tasks = self.get_available_tasks(robot)
+            
         if not available_tasks:
-            return None
+            return None, 0.0
             
         try:
-            # Get states and robot index
-            states = [self.get_state(r) for r in self.game.robots]
-            robot_idx = self.game.robots.index(robot)
+            # Get current state and Q-values
+            state = self.get_state(robot)
+            q_values = self.dqn.get_q_values(state)
             
-            # Get Q-values
-            q_values = self.dqn.get_q_values(states[robot_idx])
-            self.learning_stats['q_value_history'].append(float(q_values.max()))
-            
-            # Calculate bid values using learned weights
+            # Calculate bids for each task
             bids = []
             for task in available_tasks:
                 task_idx = task.y * GRID_SIZE + task.x
@@ -210,24 +196,57 @@ class MADQLAgent:
                 
                 bids.append((task, bid_value, factors))
             
-            if not bids:  # If no valid bids were calculated
-                return None
-            
+            if not bids:
+                return None, 0.0
+                
             # Track bid history
             self.learning_stats['bid_history'].append(max(b[1] for b in bids))
             
             # Choose task with highest bid
             chosen_task, bid_value, factors = max(bids, key=lambda x: x[1])
-            action_idx = chosen_task.y * GRID_SIZE + chosen_task.x
             
             # Update factor weights based on success/failure
             if robot.id in self.learning_stats['task_distribution']:
                 success_rate = self.learning_stats['task_distribution'][robot.id] / max(1, self.episode_count)
                 self._update_factor_weights(factors, success_rate)
             
-            # Store state and action
-            self.prev_states[robot_idx] = states[robot_idx]
-            self.prev_actions[robot_idx] = action_idx
+            return chosen_task, bid_value
+            
+        except Exception as e:
+            print(f"Warning: Error calculating bid: {e}")
+            import traceback
+            traceback.print_exc()
+            return None, 0.0
+            
+    def choose_action(self, robot):
+        """Enhanced action selection using centralized bidding"""
+        # Check if number of robots has changed and reinitialize DQN if needed
+        if len(self.game.robots) != self.dqn.num_agents:
+            print(f"Reinitializing DQN for {len(self.game.robots)} agents")
+            self.dqn = CentralizedDQN(
+                state_size=self.state_size,
+                action_size=self.action_size,
+                num_agents=len(self.game.robots)
+            )
+            self.prev_states = [None] * len(self.game.robots)
+            self.prev_actions = [None] * len(self.game.robots)
+        
+        # Get available tasks
+        available_tasks = self.get_available_tasks(robot)
+        if not available_tasks:
+            return None
+            
+        try:
+            # Use centralized bidding
+            chosen_task, _ = self.calculate_bid(robot, available_tasks)
+            
+            if chosen_task:
+                robot_idx = self.game.robots.index(robot)
+                action_idx = chosen_task.y * GRID_SIZE + chosen_task.x
+                
+                # Store state and action
+                self.prev_states[robot_idx] = self.get_state(robot)
+                self.prev_actions[robot_idx] = action_idx
             
             return chosen_task
             
