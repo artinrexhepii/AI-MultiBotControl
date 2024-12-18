@@ -217,7 +217,7 @@ class Game:
                 obstacle['dx'], obstacle['dy'] = random.choice([(0,1), (1,0), (0,-1), (-1,0)])
 
     def auction_tasks(self):
-        """Market-based task allocation using centralized bidding"""
+        """Enhanced market-based task allocation with fairness and collaboration incentives"""
         if not self.tasks:
             return
 
@@ -230,25 +230,41 @@ class Game:
         if not unassigned_robots:
             return
 
-        # Gather all bids using centralized bidding
-        all_bids = []
-        for robot in unassigned_robots:
-            for task in self.tasks:
-                chosen_task, bid_value = self.madql.calculate_bid(robot, [task])
-                if chosen_task:
-                    all_bids.append((robot, chosen_task, bid_value))
+        # Group tasks by priority for fair distribution
+        priority_tasks = {1: [], 2: [], 3: []}
+        for task in self.tasks:
+            priority_tasks[task.priority].append(task)
 
-        # Sort bids by value (highest first) and allocate tasks
-        if all_bids:
-            # Sort bids in descending order
-            all_bids.sort(key=lambda x: x[2], reverse=True)
+        # Track all bids for analysis
+        all_bids = []
+        
+        # Conduct auctions by priority level (highest first)
+        for priority in [3, 2, 1]:
+            if not priority_tasks[priority]:
+                continue
+                
+            priority_bids = []
             
-            # Keep track of assigned tasks and robots
+            # Gather bids from all unassigned robots for this priority level
+            for robot in unassigned_robots:
+                for task in priority_tasks[priority]:
+                    chosen_task, bid_value = self.madql.calculate_bid(robot, [task])
+                    if chosen_task:
+                        # Adjust bid based on team performance factors
+                        team_adjustment = self._calculate_team_adjustment(robot)
+                        adjusted_bid = bid_value * team_adjustment
+                        
+                        priority_bids.append((robot, chosen_task, adjusted_bid, bid_value))
+                        all_bids.append((robot, chosen_task, adjusted_bid, bid_value))
+
+            # Sort bids by adjusted value (highest first)
+            priority_bids.sort(key=lambda x: x[2], reverse=True)
+            
+            # Allocate tasks for this priority level
             assigned_tasks = set()
             assigned_robots = set()
             
-            # Allocate tasks based on highest bids
-            for robot, task, bid_value in all_bids:
+            for robot, task, adjusted_bid, original_bid in priority_bids:
                 if (task not in assigned_tasks and 
                     robot not in assigned_robots and 
                     task in self.tasks):  # Check if task still exists
@@ -262,10 +278,91 @@ class Game:
                     assigned_tasks.add(task)
                     assigned_robots.add(robot)
                     
-                    # Log the assignment
+                    # Record task start time for completion tracking
+                    robot.last_task_start = current_time
+                    
+                    # Log the successful assignment with adjustment info
+                    adjustment_factor = adjusted_bid / original_bid if original_bid > 0 else 1.0
                     self.add_status_message(
-                        f"Robot {robot.id} won bid for P{task.priority} task at ({task.x}, {task.y}) [Bid: {bid_value:.1f}]"
+                        f"Robot {robot.id} won P{task.priority} task at ({task.x}, {task.y}) "
+                        f"[Bid: {original_bid:.2f}, Adj: {adjustment_factor:.2f}x]"
                     )
+                else:
+                    # Log unsuccessful bid for learning
+                    self.add_status_message(
+                        f"Robot {robot.id} failed bid ({original_bid:.2f}) for P{task.priority} task"
+                    )
+
+        # Update robot states and learning based on auction results
+        self._update_auction_outcomes(all_bids, assigned_robots)
+
+    def _calculate_team_adjustment(self, robot):
+        """Calculate bid adjustment factor based on team performance"""
+        adjustment = 1.0
+        
+        # Reward consistent performance
+        if hasattr(robot, 'completed_tasks'):
+            completion_rate = robot.completed_tasks / max(1, self.total_tasks_completed)
+            adjustment *= 1.0 + (0.2 * completion_rate)  # Up to 20% bonus
+        
+        # Reward efficient path planning
+        if hasattr(robot, 'total_distance') and robot.completed_tasks > 0:
+            avg_distance = robot.total_distance / robot.completed_tasks
+            efficiency_bonus = max(0, 1.0 - (avg_distance / (2 * GRID_SIZE)))
+            adjustment *= 1.0 + (0.15 * efficiency_bonus)  # Up to 15% bonus
+        
+        # Penalize excessive waiting/congestion
+        if hasattr(robot, 'waiting_time'):
+            waiting_penalty = min(0.3, robot.waiting_time / 10.0)  # Up to 30% penalty
+            adjustment *= (1.0 - waiting_penalty)
+        
+        # Consider team contribution
+        active_robots = len([r for r in self.robots if r.target])
+        team_factor = active_robots / len(self.robots)
+        adjustment *= 1.0 + (0.1 * team_factor)  # Up to 10% bonus for team activity
+        
+        return adjustment
+
+    def _update_auction_outcomes(self, all_bids, assigned_robots):
+        """Update robot states and learning based on auction results"""
+        current_time = time.time()
+        
+        # Calculate average successful bid for reference
+        successful_bids = [bid for robot, _, _, bid in all_bids if robot in assigned_robots]
+        avg_successful_bid = sum(successful_bids) / len(successful_bids) if successful_bids else 0
+        
+        for robot, task, adjusted_bid, original_bid in all_bids:
+            # Get states for learning
+            old_state = self.madql.get_state(robot)
+            
+            if robot in assigned_robots:
+                # Successful bid reward
+                reward = task.priority * 10  # Base reward
+                
+                # Efficiency bonus
+                if original_bid < avg_successful_bid:
+                    reward += 5 * (1 - original_bid/avg_successful_bid)  # Up to 5 bonus points
+                
+                # Update robot stats
+                robot.last_success_time = current_time
+                if not hasattr(robot, 'bid_efficiency'):
+                    robot.bid_efficiency = []
+                robot.bid_efficiency.append(original_bid/avg_successful_bid if avg_successful_bid > 0 else 1.0)
+            else:
+                # Failed bid penalty
+                reward = -5  # Base penalty
+                
+                # Additional penalty for too high bids
+                if original_bid > avg_successful_bid:
+                    reward -= 5 * (original_bid/avg_successful_bid - 1)  # Up to -5 penalty points
+                
+                # Reset robot's target and path
+                robot.target = None
+                robot.path = []
+            
+            # Get new state and update learning
+            new_state = self.madql.get_state(robot)
+            self.madql.update(robot, old_state, task, reward, new_state)
 
     def update_simulation(self):
         if not self.simulation_running:
