@@ -12,17 +12,34 @@ class CellType(Enum):
     TASK = 4
 
 class Task:
-    def __init__(self, x, y, priority=1):
+    def __init__(self, x, y, priority):
         self.x = x
         self.y = y
-        self.priority = priority  # 1 (low) to 3 (high)
+        self.priority = priority
         self.creation_time = time.time()
+        self.assigned = False
         
     def get_position(self):
+        """Get task position"""
         return (self.x, self.y)
         
     def get_waiting_time(self):
+        """Get time since task creation"""
         return time.time() - self.creation_time
+        
+    def __eq__(self, other):
+        """Check if two tasks are at the same position"""
+        if not isinstance(other, Task):
+            return False
+        return self.x == other.x and self.y == other.y
+        
+    def __hash__(self):
+        """Hash based on position"""
+        return hash((self.x, self.y))
+        
+    def __str__(self):
+        """String representation"""
+        return f"Task(x={self.x}, y={self.y}, priority={self.priority})"
 
 class Robot:
     def __init__(self, x, y):
