@@ -115,6 +115,41 @@ class MADQLAgent:
         self.last_info_share = 0
         self.max_shared_memory = 100  # Limit memory of shared information
         
+        # Dynamic learning parameters
+        self.learning_params = {
+            'learning_rate': {
+                'value': LEARNING_RATE,
+                'min': 0.0001,
+                'max': 0.01,
+                'decay': 0.995,
+                'history': []
+            },
+            'epsilon': {
+                'value': EPSILON,
+                'min': 0.01,
+                'max': 1.0,
+                'decay': 0.997,
+                'history': []
+            },
+            'discount': {
+                'value': DISCOUNT_FACTOR,
+                'min': 0.8,
+                'max': 0.99,
+                'adjust_window': 100,
+                'history': []
+            }
+        }
+        
+        # Performance tracking for parameter tuning
+        self.performance_window = {
+            'size': 100,
+            'rewards': [],
+            'success_rate': [],
+            'avg_completion_time': [],
+            'last_adjustment': time.time(),
+            'adjustment_interval': 60.0  # Adjust parameters every 60 seconds
+        }
+        
     def get_state(self, robot):
         """Enhanced state representation with bid-specific features"""
         robot_idx = self.game.robots.index(robot)
@@ -225,8 +260,8 @@ class MADQLAgent:
             # Get Q-values for bid actions
             q_values = self.dqn.get_q_values(state)
             
-            # Use epsilon-greedy for bid selection
-            if random.random() < EPSILON:
+            # Use dynamically adjusted epsilon
+            if random.random() < self.learning_params['epsilon']['value']:
                 bid_action = random.randrange(self.action_size)
             else:
                 bid_action = torch.argmax(q_values).item()
@@ -571,7 +606,7 @@ class MADQLAgent:
         return self.get_performance_summary()
 
     def update_metrics(self, robot, reward, completion_time=None):
-        """Update core performance metrics"""
+        """Update metrics and adjust learning parameters"""
         current_time = time.time()
         
         # 1. Episode Rewards (keep last 1000 rewards)
@@ -625,9 +660,27 @@ class MADQLAgent:
                 )
             
             agent_stats['last_update'] = current_time
+        
+        # Update performance window for parameter tuning
+        self.performance_window['rewards'].append(reward)
+        
+        # Calculate success rate based on positive rewards
+        success = 1.0 if reward > 0 else 0.0
+        self.performance_window['success_rate'].append(success)
+        
+        if completion_time is not None:
+            self.performance_window['avg_completion_time'].append(completion_time)
+        
+        # Maintain window size
+        for key in ['rewards', 'success_rate', 'avg_completion_time']:
+            if len(self.performance_window[key]) > self.performance_window['size']:
+                self.performance_window[key] = self.performance_window[key][-self.performance_window['size']:]
+        
+        # Adjust learning parameters
+        self._adjust_learning_parameters()
 
     def get_performance_summary(self):
-        """Get concise performance summary"""
+        """Enhanced performance summary including learning parameters"""
         current_time = time.time()
         
         try:
@@ -652,6 +705,22 @@ class MADQLAgent:
                     }
                     for robot_id, stats in self.metrics['agent_performance'].items()
                 }
+            }
+            
+            # Add learning parameter information
+            summary['learning_parameters'] = {
+                name: {
+                    'current_value': param['value'],
+                    'trend': self._calculate_trend(param['history']) if param['history'] else 0
+                }
+                for name, param in self.learning_params.items()
+            }
+            
+            # Add performance trends
+            summary['performance_trends'] = {
+                'reward_trend': self._calculate_trend(self.performance_window['rewards']),
+                'success_trend': self._calculate_trend(self.performance_window['success_rate']),
+                'completion_trend': self._calculate_trend(self.performance_window['avg_completion_time'])
             }
             
             return summary
@@ -887,3 +956,83 @@ class MADQLAgent:
             # Gradually reintroduce experiences to the DQN
             for exp in self.agent_experiences[agent_id]:
                 self.dqn.remember(*exp, priority=1.0)
+
+    def _adjust_learning_parameters(self):
+        """Dynamically adjust learning parameters based on performance"""
+        current_time = time.time()
+        if current_time - self.performance_window['last_adjustment'] < self.performance_window['adjustment_interval']:
+            return
+            
+        try:
+            # Calculate performance metrics
+            recent_rewards = self.performance_window['rewards'][-self.performance_window['size']:]
+            recent_success = self.performance_window['success_rate'][-self.performance_window['size']:]
+            recent_completion = self.performance_window['avg_completion_time'][-self.performance_window['size']:]
+            
+            if not (recent_rewards and recent_success and recent_completion):
+                return
+                
+            # Calculate trend indicators
+            reward_trend = self._calculate_trend(recent_rewards)
+            success_trend = self._calculate_trend(recent_success)
+            completion_trend = self._calculate_trend(recent_completion)
+            
+            # Adjust learning rate
+            if reward_trend < 0:  # If performance is declining
+                self.learning_params['learning_rate']['value'] *= self.learning_params['learning_rate']['decay']
+            elif reward_trend > 0 and success_trend > 0:  # If performance is improving
+                self.learning_params['learning_rate']['value'] = min(
+                    self.learning_params['learning_rate']['value'] / self.learning_params['learning_rate']['decay'],
+                    self.learning_params['learning_rate']['max']
+                )
+            
+            # Adjust epsilon based on success rate
+            avg_success = sum(recent_success) / len(recent_success)
+            if avg_success > 0.8:  # High success rate, reduce exploration
+                self.learning_params['epsilon']['value'] *= self.learning_params['epsilon']['decay']
+            elif avg_success < 0.4:  # Low success rate, increase exploration
+                self.learning_params['epsilon']['value'] = min(
+                    self.learning_params['epsilon']['value'] / self.learning_params['epsilon']['decay'],
+                    self.learning_params['epsilon']['max']
+                )
+            
+            # Adjust discount factor based on completion time trend
+            if completion_trend < 0:  # Improving completion times
+                self.learning_params['discount']['value'] = min(
+                    self.learning_params['discount']['value'] * 1.001,
+                    self.learning_params['discount']['max']
+                )
+            elif completion_trend > 0:  # Worsening completion times
+                self.learning_params['discount']['value'] *= 0.999
+            
+            # Ensure parameters stay within bounds
+            for param in self.learning_params.values():
+                param['value'] = max(param['min'], min(param['max'], param['value']))
+                param['history'].append(param['value'])
+                if len(param['history']) > self.performance_window['size']:
+                    param['history'] = param['history'][-self.performance_window['size']:]
+            
+            # Update last adjustment time
+            self.performance_window['last_adjustment'] = current_time
+            
+            # Update DQN parameters
+            self.dqn.learning_rate = self.learning_params['learning_rate']['value']
+            self.dqn.gamma = self.learning_params['discount']['value']
+            
+        except Exception as e:
+            print(f"Warning: Error adjusting learning parameters: {e}")
+
+    def _calculate_trend(self, values, window_size=20):
+        """Calculate trend direction using linear regression"""
+        if len(values) < window_size:
+            return 0
+            
+        recent_values = values[-window_size:]
+        x = np.arange(window_size)
+        y = np.array(recent_values)
+        
+        try:
+            slope, _ = np.polyfit(x, y, 1)
+            return slope
+        except:
+            return 0
