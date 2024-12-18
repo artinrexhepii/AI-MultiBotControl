@@ -1,6 +1,8 @@
 from enum import Enum
 from collections import defaultdict
 import time
+import numpy as np
+import torch
 
 class CellType(Enum):
     EMPTY = 0
@@ -31,7 +33,7 @@ class Robot:
         self.waiting = False
         self.waiting_time = 0
         self.last_waiting_start = None
-        self.q_table = defaultdict(lambda: defaultdict(float))  # Changed to float default
+        self.q_table = {}  # Changed to use string keys
         self.last_move_time = time.time()
         self.completed_tasks = 0
         self.total_distance = 0
@@ -58,3 +60,25 @@ class Robot:
                 self.waiting_time += current_time - self.last_waiting_start
             self.waiting = False
             self.last_waiting_start = None
+            
+    def get_state_key(self, state):
+        """Convert state array to hashable key"""
+        if isinstance(state, np.ndarray):
+            return tuple(state.tolist())
+        elif isinstance(state, torch.Tensor):
+            return tuple(state.cpu().numpy().tolist())
+        return tuple(state)
+        
+    def get_q_value(self, state, action):
+        """Get Q-value for a state-action pair"""
+        state_key = self.get_state_key(state)
+        if state_key not in self.q_table:
+            self.q_table[state_key] = {}
+        return self.q_table[state_key].get(str(action), 0.0)
+        
+    def update_q_value(self, state, action, value):
+        """Update Q-value for a state-action pair"""
+        state_key = self.get_state_key(state)
+        if state_key not in self.q_table:
+            self.q_table[state_key] = {}
+        self.q_table[state_key][str(action)] = value
