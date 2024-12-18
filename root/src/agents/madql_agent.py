@@ -13,81 +13,293 @@ class MADQLAgent:
         self.learning_stats = {
             'episode_rewards': [],
             'q_value_history': [],
-            'bid_history': []
+            'bid_history': [],
+            'task_distribution': {},  # Track task distribution among robots
+            'completion_times': [],   # Track task completion times
+            'congestion_levels': []   # Track congestion levels
         }
         
-        # Calculate state and action sizes
-        self.state_size = (
-            2 +  # Robot position (x, y)
-            5 * (MAX_TASKS - 1) +  # Other robots' info (fixed size for max possible robots)
-            GRID_SIZE * GRID_SIZE * 4 +  # Task info (x, y, priority, waiting_time)
-            GRID_SIZE * GRID_SIZE  # Obstacle info
-        )
-        self.action_size = GRID_SIZE * GRID_SIZE  # Possible task positions
+        # Initialize learned weights for different factors
+        self.factor_weights = {
+            'q_value': 1.0,
+            'priority': 1.0,
+            'distance': 1.0,
+            'congestion': 1.0,
+            'waiting_time': 1.0
+        }
         
-        # Initialize centralized DQN
+        # Experience prioritization parameters
+        self.priority_alpha = 0.6    # Priority exponent
+        self.priority_beta = 0.4     # Importance sampling weight
+        self.max_priority = 1.0      # Maximum priority
+        
+        # Calculate state size with local and global components
+        self.local_state_size = (
+            2 +  # Robot position (x, y)
+            4 * 9 +  # 3x3 grid around robot (4 features per cell)
+            5  # Local task features
+        )
+        self.global_state_size = (
+            3 +  # Global metrics (task count, avg priority, congestion)
+            5 * (MAX_TASKS - 1)  # Other robots' compressed info
+        )
+        self.state_size = self.local_state_size + self.global_state_size
+        self.action_size = GRID_SIZE * GRID_SIZE
+        
+        # Initialize networks
         self.dqn = CentralizedDQN(
             state_size=self.state_size,
             action_size=self.action_size,
             num_agents=len(game.robots)
         )
         
-        # Store previous states and actions for learning
         self.prev_states = [None] * len(game.robots)
         self.prev_actions = [None] * len(game.robots)
         
     def get_state(self, robot):
-        """Get state tensor for a robot"""
+        """Enhanced state representation with local and global features"""
         robot_idx = self.game.robots.index(robot)
         state = []
         
-        # Robot's normalized position
+        # Local state components
+        # 1. Robot's position
         state.extend([robot.x/GRID_SIZE, robot.y/GRID_SIZE])
         
-        # Other robots' info (pad to fixed size)
+        # 2. 3x3 grid around robot
+        for dy in [-1, 0, 1]:
+            for dx in [-1, 0, 1]:
+                x, y = robot.x + dx, robot.y + dy
+                if 0 <= x < GRID_SIZE and 0 <= y < GRID_SIZE:
+                    cell = self.game.grid[y][x]
+                    # Features: is_robot, is_obstacle, is_task, task_priority
+                    state.extend([
+                        1.0 if cell == CellType.ROBOT else 0.0,
+                        1.0 if cell == CellType.OBSTACLE else 0.0,
+                        1.0 if cell in [CellType.TASK, CellType.TARGET] else 0.0,
+                        self._get_cell_priority(x, y) / 3.0
+                    ])
+                else:
+                    state.extend([0.0, 0.0, 0.0, 0.0])  # Out of bounds
+        
+        # 3. Local task features
+        nearest_task = self._find_nearest_task(robot)
+        if nearest_task:
+            state.extend([
+                nearest_task.x/GRID_SIZE,
+                nearest_task.y/GRID_SIZE,
+                nearest_task.priority/3.0,
+                nearest_task.get_waiting_time()/10.0,
+                self._calculate_path_congestion(
+                    self.game.astar.find_path((robot.x, robot.y), nearest_task.get_position())
+                )/10.0
+            ])
+        else:
+            state.extend([0.0, 0.0, 0.0, 0.0, 0.0])
+        
+        # Global state components
+        # 1. Global metrics
+        state.extend([
+            len(self.game.tasks)/MAX_TASKS,
+            sum(t.priority for t in self.game.tasks)/(3 * MAX_TASKS),
+            self._calculate_global_congestion()/10.0
+        ])
+        
+        # 2. Compressed info about other robots
         other_robots_info = []
         for i, other_robot in enumerate(self.game.robots):
             if i != robot_idx and len(other_robots_info) < 5 * (MAX_TASKS - 1):
                 other_robots_info.extend([
                     other_robot.x/GRID_SIZE,
                     other_robot.y/GRID_SIZE,
-                    other_robot.target.x/GRID_SIZE if other_robot.target else 0,
-                    other_robot.target.y/GRID_SIZE if other_robot.target else 0,
-                    other_robot.target.priority/3 if other_robot.target else 0
+                    1.0 if other_robot.target else 0.0,
+                    other_robot.target.priority/3.0 if other_robot.target else 0.0,
+                    other_robot.waiting_time/10.0
                 ])
         
-        # Pad with zeros if needed
+        # Pad if needed
         padding_needed = 5 * (MAX_TASKS - 1) - len(other_robots_info)
         if padding_needed > 0:
-            other_robots_info.extend([0] * padding_needed)
+            other_robots_info.extend([0.0] * padding_needed)
         
         state.extend(other_robots_info)
         
-        # Task info (fixed size grid representation)
-        task_info = np.zeros(GRID_SIZE * GRID_SIZE * 4)
-        for task in self.game.tasks:
-            idx = (task.y * GRID_SIZE + task.x) * 4
-            task_info[idx:idx+4] = [
-                task.x/GRID_SIZE,
-                task.y/GRID_SIZE,
-                task.priority/3,
-                min(task.get_waiting_time()/10.0, 1.0)
-            ]
-        state.extend(task_info)
-        
-        # Obstacle info (fixed size grid)
-        obstacle_info = np.zeros(GRID_SIZE * GRID_SIZE)
-        for y in range(GRID_SIZE):
-            for x in range(GRID_SIZE):
-                if self.game.grid[y][x] == CellType.OBSTACLE:
-                    obstacle_info[y * GRID_SIZE + x] = 1
-        state.extend(obstacle_info)
-        
-        # Ensure state has correct size
-        assert len(state) == self.state_size, f"State size mismatch: {len(state)} != {self.state_size}"
-        
         return np.array(state, dtype=np.float32)
     
+    def _get_cell_priority(self, x, y):
+        """Get priority of task at cell if it exists"""
+        for task in self.game.tasks:
+            if task.x == x and task.y == y:
+                return task.priority
+        return 0
+    
+    def _find_nearest_task(self, robot):
+        """Find nearest available task"""
+        if not self.game.tasks:
+            return None
+        return min(self.game.tasks, 
+                  key=lambda t: robot.manhattan_distance((robot.x, robot.y), t.get_position()))
+    
+    def _calculate_global_congestion(self):
+        """Calculate global congestion level"""
+        congestion = 0
+        for robot in self.game.robots:
+            if robot.target:
+                path = self.game.astar.find_path(
+                    (robot.x, robot.y),
+                    robot.target.get_position()
+                )
+                if path:
+                    congestion += self._calculate_path_congestion(path)
+        return congestion / len(self.game.robots) if self.game.robots else 0
+    
+    def choose_action(self, robot):
+        """Enhanced action selection with integrated learning and heuristics"""
+        # Check if number of robots has changed and reinitialize DQN if needed
+        if len(self.game.robots) != self.dqn.num_agents:
+            print(f"Reinitializing DQN for {len(self.game.robots)} agents")
+            self.dqn = CentralizedDQN(
+                state_size=self.state_size,
+                action_size=self.action_size,
+                num_agents=len(self.game.robots)
+            )
+            self.prev_states = [None] * len(self.game.robots)
+            self.prev_actions = [None] * len(self.game.robots)
+        
+        # Get available tasks first, outside the try block
+        available_tasks = self.get_available_tasks(robot)
+        if not available_tasks:
+            return None
+            
+        try:
+            # Get states and robot index
+            states = [self.get_state(r) for r in self.game.robots]
+            robot_idx = self.game.robots.index(robot)
+            
+            # Get Q-values
+            q_values = self.dqn.get_q_values(states[robot_idx])
+            self.learning_stats['q_value_history'].append(float(q_values.max()))
+            
+            # Calculate bid values using learned weights
+            bids = []
+            for task in available_tasks:
+                task_idx = task.y * GRID_SIZE + task.x
+                q_value = float(q_values[task_idx])
+                
+                # Get path and congestion information
+                distance = robot.manhattan_distance((robot.x, robot.y), task.get_position())
+                path = self.game.astar.find_path((robot.x, robot.y), task.get_position())
+                congestion = self._calculate_path_congestion(path) if path else float('inf')
+                
+                # Calculate normalized factors
+                factors = {
+                    'q_value': q_value / max(1e-6, q_values.max()),
+                    'priority': task.priority / 3.0,
+                    'distance': 1.0 - (distance / (2 * GRID_SIZE)),
+                    'congestion': 1.0 - (congestion / (len(path) if path else 1)),
+                    'waiting_time': min(task.get_waiting_time() / 10.0, 1.0)
+                }
+                
+                # Calculate weighted bid
+                bid_value = sum(self.factor_weights[k] * v for k, v in factors.items())
+                
+                # Apply fairness adjustment
+                completion_count = self.learning_stats['task_distribution'].get(robot.id, 0)
+                fairness_factor = 1.0 + (0.1 * (1.0 - completion_count / max(1, self.total_tasks_completed)))
+                bid_value *= fairness_factor
+                
+                bids.append((task, bid_value, factors))
+            
+            if not bids:  # If no valid bids were calculated
+                return None
+            
+            # Track bid history
+            self.learning_stats['bid_history'].append(max(b[1] for b in bids))
+            
+            # Choose task with highest bid
+            chosen_task, bid_value, factors = max(bids, key=lambda x: x[1])
+            action_idx = chosen_task.y * GRID_SIZE + chosen_task.x
+            
+            # Update factor weights based on success/failure
+            if robot.id in self.learning_stats['task_distribution']:
+                success_rate = self.learning_stats['task_distribution'][robot.id] / max(1, self.episode_count)
+                self._update_factor_weights(factors, success_rate)
+            
+            # Store state and action
+            self.prev_states[robot_idx] = states[robot_idx]
+            self.prev_actions[robot_idx] = action_idx
+            
+            return chosen_task
+            
+        except Exception as e:
+            print(f"Warning: Error during action selection: {e}")
+            return random.choice(available_tasks) if available_tasks else None
+    
+    def _update_factor_weights(self, factors, success_rate):
+        """Update weights of different factors based on success rate"""
+        learning_rate = 0.01
+        for factor, value in factors.items():
+            if success_rate > 0.5:  # If robot is successful
+                # Increase weights of factors that contributed to success
+                self.factor_weights[factor] += learning_rate * value * (success_rate - 0.5)
+            else:
+                # Decrease weights of factors that may have contributed to failure
+                self.factor_weights[factor] -= learning_rate * value * (0.5 - success_rate)
+            
+            # Normalize weights
+            total = sum(self.factor_weights.values())
+            for k in self.factor_weights:
+                self.factor_weights[k] /= total
+    
+    def update(self, robot, old_state, action, reward, new_state):
+        """Enhanced update with prioritized experience replay"""
+        robot_idx = self.game.robots.index(robot)
+        
+        # Check if number of robots has changed and reinitialize DQN if needed
+        if len(self.game.robots) != self.dqn.num_agents:
+            print(f"Reinitializing DQN for {len(self.game.robots)} agents")
+            self.dqn = CentralizedDQN(
+                state_size=self.state_size,
+                action_size=self.action_size,
+                num_agents=len(self.game.robots)
+            )
+            self.prev_states = [None] * len(self.game.robots)
+            self.prev_actions = [None] * len(self.game.robots)
+            return  # Skip this update as we've reinitialized
+        
+        try:
+            # Calculate TD error for prioritization
+            with torch.no_grad():
+                current_q = self.dqn.get_q_values(old_state)[action]
+                next_q = self.dqn.get_q_values(new_state).max()
+                td_error = abs(reward + self.dqn.gamma * next_q - current_q)
+            
+            # Update task distribution statistics
+            if action == robot.target:
+                self.learning_stats['task_distribution'][robot.id] = \
+                    self.learning_stats['task_distribution'].get(robot.id, 0) + 1
+                
+                # Track completion time
+                if hasattr(robot, 'last_task_start'):
+                    completion_time = time.time() - robot.last_task_start
+                    self.learning_stats['completion_times'].append(completion_time)
+            
+            # Store experience with priority
+            priority = min((td_error + 1e-6) ** self.priority_alpha, self.max_priority)
+            self.dqn.remember(old_state, action, reward, new_state, priority)
+            
+            # Train the network
+            self.dqn.train_step(self.priority_beta)
+            
+            # Update statistics
+            self.learning_stats['episode_rewards'].append(reward)
+            if hasattr(self.dqn, 'get_training_stats'):
+                training_stats = self.dqn.get_training_stats()
+                if training_stats:
+                    self.learning_stats.update(training_stats)
+                    
+        except Exception as e:
+            print(f"Warning: Error during update: {e}")
+            
     def get_available_tasks(self, robot):
         """Get list of available tasks that can be assigned"""
         return [task for task in self.game.tasks 
@@ -166,70 +378,6 @@ class MADQLAgent:
         self.learning_stats['episode_rewards'].append(reward)
         return reward
     
-    def choose_action(self, robot):
-        """Enhanced action selection with better exploration and exploitation"""
-        # Get states for all robots
-        states = [self.get_state(r) for r in self.game.robots]
-        robot_idx = self.game.robots.index(robot)
-        
-        # Reinitialize DQN if number of robots has changed
-        if len(self.game.robots) != self.dqn.num_agents:
-            self.dqn = CentralizedDQN(
-                state_size=self.state_size,
-                action_size=self.action_size,
-                num_agents=len(self.game.robots)
-            )
-            self.prev_states = [None] * len(self.game.robots)
-            self.prev_actions = [None] * len(self.game.robots)
-        
-        # Get Q-values for all actions
-        try:
-            q_values = self.dqn.get_q_values(states[robot_idx])
-            self.learning_stats['q_value_history'].append(float(q_values.max()))
-            
-            # Calculate bid values for available tasks
-            available_tasks = self.get_available_tasks(robot)
-            if not available_tasks:
-                return None
-            
-            bids = []
-            for task in available_tasks:
-                task_idx = task.y * GRID_SIZE + task.x
-                q_value = float(q_values[task_idx])
-                
-                # Calculate bid using Q-value and heuristics
-                distance = robot.manhattan_distance((robot.x, robot.y), task.get_position())
-                path = self.game.astar.find_path((robot.x, robot.y), task.get_position())
-                congestion = self._calculate_path_congestion(path) if path else float('inf')
-                
-                bid_value = (
-                    q_value * 2.0 +  # Learning component
-                    task.priority * 30.0 +  # Priority bonus
-                    (1.0 - distance/GRID_SIZE) * 20.0 +  # Distance factor
-                    (1.0 - congestion/len(path) if path else 0) * 10.0 +  # Congestion factor
-                    task.get_waiting_time() * 5.0  # Waiting time bonus
-                )
-                bids.append((task, bid_value))
-                
-            # Track bid history
-            self.learning_stats['bid_history'].append(max(b[1] for b in bids) if bids else 0)
-            
-            # Choose task with highest bid
-            chosen_task, _ = max(bids, key=lambda x: x[1])
-            action_idx = chosen_task.y * GRID_SIZE + chosen_task.x
-            
-            # Store state and action for learning
-            self.prev_states[robot_idx] = states[robot_idx]
-            self.prev_actions[robot_idx] = action_idx
-            
-            return chosen_task
-            
-        except Exception as e:
-            print(f"Warning: Error during action selection: {e}")
-            if available_tasks:
-                return random.choice(available_tasks)
-            return None
-            
     def _calculate_path_congestion(self, path):
         """Helper method to calculate path congestion"""
         if not path:
@@ -255,66 +403,3 @@ class MADQLAgent:
             'avg_bid': sum(self.learning_stats['bid_history'][-100:]) / len(self.learning_stats['bid_history'][-100:]),
             'total_episodes': self.episode_count
         }
-    
-    def update(self, robot, old_state, action, reward, new_state):
-        """Update DQN with experience"""
-        robot_idx = self.game.robots.index(robot)
-        
-        # Collect experiences from all robots
-        states = []
-        actions = []
-        rewards = []
-        next_states = []
-        dones = []
-        
-        # Calculate expected state size
-        expected_state_size = (
-            2 +  # Robot position
-            5 * (len(self.game.robots) - 1) +  # Other robots' info
-            GRID_SIZE * GRID_SIZE * 4 +  # Task info
-            GRID_SIZE * GRID_SIZE  # Obstacle info
-        )
-        
-        for i, r in enumerate(self.game.robots):
-            if self.prev_states[i] is not None:
-                # Ensure state has correct shape
-                state = self.prev_states[i]
-                if isinstance(state, torch.Tensor):
-                    state = state.numpy()
-                if len(state) != expected_state_size:
-                    # Skip this experience if state size doesn't match
-                    continue
-                states.append(state)
-                
-                # Store action
-                actions.append(self.prev_actions[i])
-                rewards.append(reward if i == robot_idx else 0)
-                
-                # Get and validate next state
-                next_state = self.get_state(r)
-                if isinstance(next_state, torch.Tensor):
-                    next_state = next_state.numpy()
-                if len(next_state) != expected_state_size:
-                    # Skip this experience if next state size doesn't match
-                    continue
-                next_states.append(next_state)
-                
-                dones.append(False)
-        
-        if states:  # Only update if we have valid experiences
-            try:
-                # Convert lists to numpy arrays with explicit shapes
-                states = np.array(states, dtype=np.float32).reshape(-1, expected_state_size)
-                actions = np.array(actions, dtype=np.int64)
-                rewards = np.array(rewards, dtype=np.float32)
-                next_states = np.array(next_states, dtype=np.float32).reshape(-1, expected_state_size)
-                dones = np.array(dones, dtype=np.float32)
-                
-                self.dqn.remember(states, actions, rewards, next_states, dones)
-                self.dqn.train_step()
-            except (ValueError, RuntimeError) as e:
-                print(f"Warning: Skipping update due to shape mismatch: {e}")
-            
-        # Count episode for metrics
-        if action == robot.target:
-            self.episode_count += 1
