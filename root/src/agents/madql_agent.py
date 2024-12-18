@@ -67,6 +67,19 @@ class MADQLAgent:
         self.prev_actions = [None] * len(game.robots)
         self.prev_bids = {}  # Track previous bids for each robot
         
+        # Add collaboration-specific tracking
+        self.shared_info = {
+            'obstacle_updates': [],  # Recent obstacle movements/positions
+            'task_priorities': {},   # Shared task priority assessments
+            'path_conflicts': set(), # Areas with potential path conflicts
+            'subgoal_assignments': {} # Track subgoal assignments for shared tasks
+        }
+        
+        # Collaboration parameters
+        self.info_share_interval = 1.0  # Share info every second
+        self.last_info_share = 0
+        self.max_shared_memory = 100  # Limit memory of shared information
+        
     def get_state(self, robot):
         """Enhanced state representation with bid-specific features"""
         robot_idx = self.game.robots.index(robot)
@@ -160,7 +173,7 @@ class MADQLAgent:
         return min(1.0, unassigned_robots / len(self.game.tasks))
     
     def calculate_bid(self, robot, available_tasks=None):
-        """Calculate bid using learned Q-values"""
+        """Enhanced bid calculation with collaboration awareness"""
         if available_tasks is None:
             available_tasks = self.get_available_tasks(robot)
             
@@ -168,6 +181,9 @@ class MADQLAgent:
             return None, 0.0
             
         try:
+            # Share and process team information before bidding
+            self.share_information(robot)
+            
             # Get current state
             state = self.get_state(robot)
             
@@ -183,12 +199,14 @@ class MADQLAgent:
             # Convert action to bid value
             bid_value = self.min_bid + bid_action * self.bid_increment
             
+            # Adjust bid based on shared information
+            bid_value = self._adjust_bid_with_shared_info(bid_value, robot, available_tasks)
+            
             # Store bid for learning
             self.prev_bids[robot.id] = bid_value
             
-            # Choose task with highest priority * bid_value
-            chosen_task = max(available_tasks, 
-                            key=lambda t: t.priority * bid_value / (1 + robot.manhattan_distance((robot.x, robot.y), t.get_position())))
+            # Choose task considering team context
+            chosen_task = self._choose_task_with_collaboration(available_tasks, bid_value, robot)
             
             # Track bid history
             self.learning_stats['bid_history'].append(bid_value)
@@ -495,3 +513,185 @@ class MADQLAgent:
             'avg_bid': sum(self.learning_stats['bid_history'][-100:]) / len(self.learning_stats['bid_history'][-100:]),
             'total_episodes': self.episode_count
         }
+    
+    def share_information(self, robot):
+        """Share and process information with other robots"""
+        current_time = time.time()
+        if current_time - self.last_info_share < self.info_share_interval:
+            return
+            
+        self.last_info_share = current_time
+        robot_pos = (robot.x, robot.y)
+        
+        # 1. Share obstacle information
+        visible_obstacles = self._get_visible_obstacles(robot)
+        self.shared_info['obstacle_updates'] = (
+            [(pos, current_time) for pos, _ in self.shared_info['obstacle_updates'][-self.max_shared_memory:]] +
+            [(pos, current_time) for pos in visible_obstacles]
+        )
+        
+        # 2. Update shared task priorities
+        if robot.target:
+            # Calculate task value considering team context
+            task_value = self._calculate_team_task_value(robot.target, robot)
+            self.shared_info['task_priorities'][robot.target.get_position()] = {
+                'value': task_value,
+                'assigned_to': robot.id,
+                'timestamp': current_time
+            }
+        
+        # 3. Share path information
+        if robot.path:
+            # Add robot's planned path to shared information
+            path_area = set((x, y) for x, y in robot.path)
+            self.shared_info['path_conflicts'].update(path_area)
+            
+            # Clean up old path conflicts
+            self._cleanup_path_conflicts()
+        
+        # 4. Process shared information for decision making
+        self._process_shared_information(robot)
+
+    def _get_visible_obstacles(self, robot):
+        """Get obstacles visible to the robot within its observation range"""
+        visible = set()
+        obs_range = 3  # Observable range (3x3 grid)
+        
+        for dy in range(-obs_range, obs_range + 1):
+            for dx in range(-obs_range, obs_range + 1):
+                x, y = robot.x + dx, robot.y + dy
+                if (0 <= x < GRID_SIZE and 0 <= y < GRID_SIZE and
+                    self.game.grid[y][x] == CellType.OBSTACLE):
+                    visible.add((x, y))
+        
+        return visible
+
+    def _calculate_team_task_value(self, task, robot):
+        """Calculate task value considering team context"""
+        value = task.priority * 10.0  # Base value from priority
+        
+        # Adjust for team positioning
+        team_positions = [(r.x, r.y) for r in self.game.robots if r != robot]
+        avg_team_distance = 0
+        if team_positions:
+            distances = [robot.manhattan_distance(pos, task.get_position()) for pos in team_positions]
+            avg_team_distance = sum(distances) / len(distances)
+            # Increase value if task is far from team's current focus
+            value *= (1.0 + avg_team_distance / GRID_SIZE)
+        
+        # Adjust for task urgency
+        waiting_time = task.get_waiting_time()
+        value *= (1.0 + min(waiting_time / 10.0, 1.0))
+        
+        return value
+
+    def _process_shared_information(self, robot):
+        """Process shared information for better decision making"""
+        current_time = time.time()
+        
+        # 1. Update path planning based on shared obstacle information
+        recent_obstacles = {pos for pos, t in self.shared_info['obstacle_updates']
+                          if current_time - t < 5.0}  # Consider obstacles reported in last 5 seconds
+        
+        # 2. Consider team task assignments
+        if robot.target:
+            target_pos = robot.target.get_position()
+            if target_pos in self.shared_info['task_priorities']:
+                task_info = self.shared_info['task_priorities'][target_pos]
+                if (task_info['assigned_to'] != robot.id and 
+                    task_info['value'] > self._calculate_team_task_value(robot.target, robot)):
+                    # Consider yielding task to other robot
+                    robot.target = None
+                    robot.path = []
+        
+        # 3. Avoid path conflicts
+        if robot.path:
+            conflict_found = False
+            for pos in robot.path:
+                if pos in self.shared_info['path_conflicts']:
+                    conflict_found = True
+                    break
+            if conflict_found:
+                # Recalculate path avoiding conflicts
+                if robot.target:
+                    new_path = self.game.astar.find_path(
+                        (robot.x, robot.y),
+                        robot.target.get_position(),
+                        blocked_positions=self.shared_info['path_conflicts']
+                    )
+                    if new_path:
+                        robot.path = new_path
+
+    def _cleanup_path_conflicts(self):
+        """Remove old path conflicts"""
+        # Keep only conflicts that are still relevant
+        active_paths = set()
+        for robot in self.game.robots:
+            if robot.path:
+                active_paths.update((x, y) for x, y in robot.path)
+        self.shared_info['path_conflicts'] = self.shared_info['path_conflicts'].intersection(active_paths)
+
+    def _adjust_bid_with_shared_info(self, bid_value, robot, available_tasks):
+        """Adjust bid value based on shared information"""
+        adjustment = 1.0
+        
+        # 1. Adjust for team task distribution
+        team_positions = [(r.x, r.y) for r in self.game.robots if r != robot]
+        if team_positions and available_tasks:
+            # Calculate average distance to team
+            avg_team_distances = []
+            for task in available_tasks:
+                task_pos = task.get_position()
+                team_distances = [robot.manhattan_distance(pos, task_pos) for pos in team_positions]
+                avg_team_distances.append(sum(team_distances) / len(team_distances))
+            
+            # Prefer tasks that are farther from team's current positions
+            max_team_dist = max(avg_team_distances)
+            if max_team_dist > 0:
+                team_distribution_factor = max(avg_team_distances) / max_team_dist
+                adjustment *= (1.0 + 0.2 * team_distribution_factor)  # Up to 20% boost
+        
+        # 2. Adjust for path conflicts
+        if robot.path:
+            conflict_count = sum(1 for pos in robot.path if pos in self.shared_info['path_conflicts'])
+            if conflict_count > 0:
+                adjustment *= (1.0 - 0.1 * conflict_count)  # Reduce bid by 10% per conflict
+        
+        # 3. Adjust for task priority sharing
+        if robot.target:
+            target_pos = robot.target.get_position()
+            if target_pos in self.shared_info['task_priorities']:
+                other_value = self.shared_info['task_priorities'][target_pos]['value']
+                own_value = self._calculate_team_task_value(robot.target, robot)
+                if other_value > own_value:
+                    adjustment *= 0.8  # Reduce bid if others value the task more
+        
+        return bid_value * adjustment
+
+    def _choose_task_with_collaboration(self, available_tasks, bid_value, robot):
+        """Choose task considering team collaboration"""
+        if not available_tasks:
+            return None
+            
+        task_scores = []
+        for task in available_tasks:
+            score = task.priority * bid_value
+            
+            # Distance factor
+            distance = robot.manhattan_distance((robot.x, robot.y), task.get_position())
+            score /= (1 + distance)
+            
+            # Team positioning factor
+            team_value = self._calculate_team_task_value(task, robot)
+            score *= team_value
+            
+            # Path conflict avoidance
+            path = self.game.astar.find_path((robot.x, robot.y), task.get_position())
+            if path:
+                conflicts = sum(1 for pos in path if pos in self.shared_info['path_conflicts'])
+                score *= (1.0 / (1.0 + conflicts))
+            
+            task_scores.append((task, score))
+        
+        # Choose task with highest score
+        return max(task_scores, key=lambda x: x[1])[0]
