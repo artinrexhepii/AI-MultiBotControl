@@ -203,72 +203,87 @@ class MADQLAgent:
             return None, 0.0
     
     def get_reward(self, robot, old_state, action, new_state):
-        """Enhanced reward function with bid-specific rewards"""
+        """Simplified reward function focusing on key performance metrics and team collaboration"""
         if action is None:
-            return -10
+            return -1.0  # Small penalty for no action
         
-        reward = 0
+        reward = 0.0
         robot_idx = self.game.robots.index(robot)
         
-        # Get the bid value used
-        bid_value = self.prev_bids.get(robot.id, 0.0)
-        
         if isinstance(action, Task):
-            # Base reward scaled by priority and urgency
-            waiting_time = action.get_waiting_time()
-            urgency_factor = min(waiting_time / 10.0, 2.0)
-            
-            # Bid efficiency reward
-            if robot.target == action:  # Successful bid
-                # Reward higher for winning with lower bid
-                bid_efficiency = 1.0 - (bid_value / self.max_bid)
-                reward += action.priority * 20 * urgency_factor * (1 + bid_efficiency)
+            # 1. Task Completion Reward (Primary Component)
+            if robot.target == action:  # Successful task assignment
+                # Base reward scaled by priority
+                reward += 10.0 * action.priority  # 10/20/30 for priorities 1/2/3
                 
-                # Track successful bid
-                if robot.id not in self.learning_stats['bid_success_rate']:
-                    self.learning_stats['bid_success_rate'][robot.id] = []
-                self.learning_stats['bid_success_rate'][robot.id].append(1)
-            else:  # Unsuccessful bid
-                # Penalize high bids that didn't win
-                bid_penalty = bid_value / self.max_bid
-                reward -= 10 * bid_penalty
+                # Completion time efficiency bonus
+                if hasattr(robot, 'last_task_start'):
+                    completion_time = time.time() - robot.last_task_start
+                    time_efficiency = max(0, 1.0 - (completion_time / 20.0))  # Cap at 20 seconds
+                    reward += 5.0 * time_efficiency  # Up to 5 points for quick completion
                 
-                # Track unsuccessful bid
-                if robot.id not in self.learning_stats['bid_success_rate']:
-                    self.learning_stats['bid_success_rate'][robot.id] = []
-                self.learning_stats['bid_success_rate'][robot.id].append(0)
+                # Team completion rate bonus
+                team_tasks_completed = sum(1 for r in self.game.robots if hasattr(r, 'completed_tasks'))
+                if team_tasks_completed > 0:
+                    team_efficiency = robot.completed_tasks / team_tasks_completed
+                    reward += 5.0 * team_efficiency  # Up to 5 points for team contribution
             
-            # Existing distance and congestion penalties
-            dist = robot.manhattan_distance((robot.x, robot.y), action.get_position())
-            reward -= dist * 2
+            # 2. Distance Optimization (Secondary Component)
+            current_dist = robot.manhattan_distance((robot.x, robot.y), action.get_position())
+            if hasattr(robot, 'prev_distance'):
+                # Reward getting closer, penalize getting further
+                distance_change = robot.prev_distance - current_dist
+                reward += distance_change * 0.5  # Small continuous reward/penalty
+            robot.prev_distance = current_dist
             
+            # 3. Path Efficiency (Penalty Component)
             path = self.game.astar.find_path((robot.x, robot.y), action.get_position())
             if path:
+                # Penalize path length relative to manhattan distance
+                path_efficiency = current_dist / len(path)
+                if path_efficiency < 0.8:  # If path is significantly longer than direct distance
+                    reward -= 2.0 * (1.0 - path_efficiency)  # Up to -2 points
+                
+                # Penalize congestion
                 congestion = self._calculate_path_congestion(path)
-                reward -= congestion * 5
-                
-                # Team coordination consideration
-                path_conflicts = self._calculate_path_conflicts(robot, path)
-                reward -= path_conflicts * 10
-                
-                if len(path) < dist:
-                    reward += 5
+                if congestion > 0:
+                    congestion_ratio = congestion / len(path)
+                    reward -= 3.0 * congestion_ratio  # Up to -3 points for heavy congestion
             else:
-                reward -= 50
+                reward -= 5.0  # Significant penalty for no valid path
             
-            # Global efficiency rewards
-            if robot.target:
-                active_robots = len([r for r in self.game.robots if r.target])
-                team_factor = active_robots / len(self.game.robots)
-                reward += team_factor * 10
+            # 4. Team Collaboration (Bonus/Penalty Component)
+            # Calculate team dispersion (reward even distribution of robots)
+            robot_positions = [(r.x, r.y) for r in self.game.robots]
+            avg_robot_distance = 0
+            if len(robot_positions) > 1:
+                distances = []
+                for i, pos1 in enumerate(robot_positions):
+                    for pos2 in robot_positions[i+1:]:
+                        distances.append(abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1]))
+                avg_robot_distance = sum(distances) / len(distances)
+                dispersion_factor = min(1.0, avg_robot_distance / (GRID_SIZE / 2))
+                reward += 2.0 * dispersion_factor  # Up to 2 points for good dispersion
             
-            # Completion rewards
-            if robot.target and robot.manhattan_distance((robot.x, robot.y), robot.target.get_position()) == 0:
-                reward += 100 * robot.target.priority
-                team_completion_rate = self.game.total_tasks_completed / max(1, time.time() - self.game.start_time)
-                reward += team_completion_rate * 20
+            # Penalize task conflicts (multiple robots targeting same area)
+            conflict_count = 0
+            target_area = set((x, y) for x in range(max(0, action.x-1), min(GRID_SIZE, action.x+2))
+                                   for y in range(max(0, action.y-1), min(GRID_SIZE, action.y+2)))
+            for other_robot in self.game.robots:
+                if other_robot != robot and other_robot.target:
+                    other_target = other_robot.target
+                    other_area = set((x, y) for x in range(max(0, other_target.x-1), min(GRID_SIZE, other_target.x+2))
+                                          for y in range(max(0, other_target.y-1), min(GRID_SIZE, other_target.y+2)))
+                    if target_area & other_area:  # If areas overlap
+                        conflict_count += 1
+            
+            if conflict_count > 0:
+                reward -= 2.0 * conflict_count  # -2 points per conflict
         
-        # Track reward
+        # Normalize reward to a reasonable range (-10 to +50)
+        reward = max(-10.0, min(50.0, reward))
+        
+        # Track reward for this episode
         self.learning_stats['episode_rewards'].append(reward)
         return reward
     
