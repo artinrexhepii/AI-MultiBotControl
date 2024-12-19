@@ -1,9 +1,7 @@
 import random
 from enum import Enum
-from collections import defaultdict
 import time
 import numpy as np
-import tensorflow as tf
 
 class CellType(Enum):
     EMPTY = 0

@@ -4,7 +4,6 @@ import time
 import numpy as np
 from src.core.constants import *
 from src.core.entities import Robot, CellType, Task
-from src.agents.madql_agent import MADQLAgent
 from src.agents.astar import AStar
 from src.ui.button import Button
 from src.utils.metrics import PerformanceMetrics
@@ -268,30 +267,6 @@ class Game:
 
                 # Print successful bid message
                 print(f"Robot {robot.id} won P{task.priority} task with bid {bid_value:.2f}")
-                self.add_status_message(
-                    f"Auction: Robot {robot.id} won P{task.priority} task with bid {bid_value:.2f}"
-                )
-
-
-        # Sort bids by value (higher bid wins)
-        bids.sort(key=lambda x: x[2], reverse=True)
-
-        # Assign tasks to highest bidders
-        assigned_tasks = set()
-        assigned_robots = set()
-
-        for robot, task, bid_value in bids:
-            if (robot not in assigned_robots and
-                    task not in assigned_tasks and
-                    task in self.tasks):  # Check if task still available
-
-                # Assign task
-                self.grid[task.y][task.x] = CellType.TARGET
-                robot.set_target(task)
-                self.tasks.remove(task)
-                assigned_tasks.add(task)
-                assigned_robots.add(robot)
-
                 self.add_status_message(
                     f"Auction: Robot {robot.id} won P{task.priority} task with bid {bid_value:.2f}"
                 )

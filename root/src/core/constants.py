@@ -25,11 +25,6 @@ robot_image = pygame.transform.scale(robot_image, (CELL_SIZE, CELL_SIZE))
 obstacle_image = pygame.image.load('root/src/images/barrier.png')
 obstacle_image = pygame.transform.scale(obstacle_image, (CELL_SIZE, CELL_SIZE))  
 
-# MADQL Parameters
-LEARNING_RATE = 0.1
-DISCOUNT_FACTOR = 0.9
-EPSILON = 0.1
-
 # Simulation Parameters
 MOVE_DELAY = 0.5  # seconds between moves
 TASK_GEN_CHANCE = 0.05  # 5% chance per update to generate a new task
