@@ -45,16 +45,6 @@ class PerformanceMetrics:
         metrics['collision_avoidance_rate'] = (
             total_replans + total_waits) / total_distance if total_distance > 0 else 0
         
-        # Learning metrics
-        avg_q_values = []
-        for robot in game.robots:
-            if robot.q_table:
-                q_values = [v for state_values in robot.q_table.values() 
-                          for v in state_values.values()]
-                if q_values:
-                    avg_q_values.append(np.mean(q_values))
-        metrics['avg_q_value'] = np.mean(avg_q_values) if avg_q_values else 0
-        
         # Theoretical vs actual performance
         theoretical_min_distance = 0
         theoretical_min_time = 0
@@ -89,6 +79,5 @@ class PerformanceMetrics:
             f"Priority 1 Tasks: {metrics['p1_tasks']} ({metrics['p1_avg_time']:.1f}s avg)",
             f"Priority 2 Tasks: {metrics['p2_tasks']} ({metrics['p2_avg_time']:.1f}s avg)",
             f"Priority 3 Tasks: {metrics['p3_tasks']} ({metrics['p3_avg_time']:.1f}s avg)",
-            f"Overall Efficiency: {metrics['overall_efficiency']:.2f}",
-            f"Learning Progress: {metrics['avg_q_value']:.2f}"
+            f"Overall Efficiency: {metrics['overall_efficiency']:.2f}"
         ] 

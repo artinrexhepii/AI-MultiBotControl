@@ -88,8 +88,6 @@ class Game:
                 if self.grid[grid_y][grid_x] == CellType.EMPTY:
                     self.grid[grid_y][grid_x] = CellType.ROBOT
                     
-                    # Assuming you have a DQN model or object to pass here (use None if not required)
-
                     # Create a new robot object and assign properties
                     new_robot = Robot(grid_x, grid_y, self.robot_counter)  # Pass id and dqn
                     
@@ -291,12 +289,6 @@ class Game:
         # Run auction-based task allocation
         self.auction_tasks()
         
-
-            
-        # First, reset waiting status for all robots at the start of each update
-        for robot in self.robots:
-            robot.waiting = False
-            
         # Sort robots by priority of their tasks and waiting time
         active_robots = [r for r in self.robots if r.target]
         active_robots.sort(key=lambda r: (
@@ -379,8 +371,6 @@ class Game:
                                             break
 
                 if not collision:
-                    # Get old state before moving
-                    old_state = robot.get_state()
                     # Update grid and robot position
                     self.grid[robot.y][robot.x] = CellType.EMPTY
                     old_pos = (robot.x, robot.y)
@@ -390,9 +380,6 @@ class Game:
                     robot.last_move_time = current_time
                     robot.total_distance += 1
                     robot.waiting = False
-
-                    new_state = robot.get_state()
-
                     
                     if robot.target and (robot.x, robot.y) == robot.target.get_position():
                         completed_priority = robot.target.priority
@@ -422,7 +409,7 @@ class Game:
                 x, y = random.randint(0, GRID_SIZE-1), random.randint(0, GRID_SIZE-1)
                 if self.grid[y][x] == CellType.EMPTY:
                     self.grid[y][x] = CellType.ROBOT
-                    new_robot = Robot(x, y, id=self.robot_counter + 1)  # No dqn needed now
+                    new_robot = Robot(x, y, id=self.robot_counter + 1)
                     self.robot_counter += 1
                     self.robots.append(new_robot)
                     break
