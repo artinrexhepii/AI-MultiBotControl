@@ -84,10 +84,6 @@ class Game:
             grid_x = pos[0] // CELL_SIZE
             grid_y = pos[1] // CELL_SIZE
             
-            # Check if click is within grid boundaries
-            if grid_x >= GRID_SIZE or grid_y >= GRID_SIZE or grid_x < 0 or grid_y < 0:
-                return
-            
             if self.current_tool == 'robot':
                 if self.grid[grid_y][grid_x] == CellType.EMPTY:
                     self.grid[grid_y][grid_x] = CellType.ROBOT
@@ -184,8 +180,7 @@ class Game:
                 self.add_status_message(f"Added moving obstacle at ({x}, {y})")
 
     def update_moving_obstacles(self, current_time):
-        """Update positions of moving obstacles and treat other robots as moving obstacles"""
-        # First handle actual moving obstacles
+        """Update positions of moving obstacles"""
         for obstacle in self.moving_obstacles[:]:
             if current_time - obstacle['last_move'] < OBSTACLE_MOVE_DELAY:
                 continue
@@ -206,37 +201,6 @@ class Game:
             else:
                 # Change direction if blocked
                 obstacle['dx'], obstacle['dy'] = random.choice([(0,1), (1,0), (0,-1), (-1,0)])
-        
-        # Now handle robots as moving obstacles for pathfinding
-        robot_obstacles = []
-        for robot in self.robots:
-            if robot.path:  # If robot is moving
-                next_pos = robot.path[0]  # Get its next position
-                robot_obstacles.append({
-                    'x': robot.x,
-                    'y': robot.y,
-                    'next_x': next_pos[0],
-                    'next_y': next_pos[1],
-                    'robot': robot
-                })
-        
-        # Update paths for all robots considering others as moving obstacles
-        for robot in self.robots:
-            if robot.path:
-                # Check if path intersects with any other robot's movement
-                path_invalid = False
-                for obs in robot_obstacles:
-                    if obs['robot'] != robot:  # Don't check against self
-                        # Check if any point in our path intersects with other robot's current or next position
-                        for path_pos in robot.path:
-                            if ((path_pos[0] == obs['x'] and path_pos[1] == obs['y']) or
-                                (path_pos[0] == obs['next_x'] and path_pos[1] == obs['next_y'])):
-                                path_invalid = True
-                                break
-                
-                if path_invalid:
-                    robot.path = []
-                    self.add_status_message(f"Robot {robot.id}: Replanning due to moving robot")
 
     def auction_tasks(self):
         """Market-based task allocation using auction mechanism."""
@@ -325,23 +289,37 @@ class Game:
         # Run auction-based task allocation
         self.auction_tasks()
         
-        # Process all robots
+        # Sort robots by priority of their tasks and waiting time
+        active_robots = [r for r in self.robots if r.target]
+        active_robots.sort(key=lambda r: (
+            r.target.priority if r.target else 0,
+            -r.waiting_time,  # Negative so longer waiting time gets priority
+            r.manhattan_distance((r.x, r.y), r.target.get_position()) if r.target else float('inf')
+        ), reverse=True)
+            
+        # Process all robots, not just active ones
         for robot in self.robots:
             if current_time - robot.last_move_time < MOVE_DELAY:
                 continue  # Skip if not enough time has passed since last move
+                
+            # Check if path is still valid
+            if robot.path:
+                path_invalid = False
+                for pos in robot.path:
+                    if self.grid[pos[1]][pos[0]] == CellType.OBSTACLE:
+                        path_invalid = True
+                        break
+                if path_invalid:
+                    robot.path = []
+                    self.add_status_message(f"Robot {robot.id}: Replanning due to obstacle")
 
             if not robot.path:
                 if robot.target:
-                    # Create a temporary grid with current obstacles
-                    temp_grid = [row[:] for row in self.grid]
-                    
-                    # Add other robots' current and next positions as obstacles
+                    # Create a temporary grid with other robots marked as obstacles
+                    temp_grid = [row[:] for row in self.grid]  # Create a deep copy
                     for other_robot in self.robots:
                         if other_robot != robot:
                             temp_grid[other_robot.y][other_robot.x] = CellType.OBSTACLE
-                            if other_robot.path:  # If other robot is moving
-                                next_pos = other_robot.path[0]
-                                temp_grid[next_pos[1]][next_pos[0]] = CellType.OBSTACLE
                     
                     # Use the temporary grid for pathfinding
                     self.astar.grid = temp_grid
@@ -355,12 +333,13 @@ class Game:
                     if robot.path:
                         path_length = len(robot.path)
                         self.add_status_message(
-                            f"Robot {robot.id}: Found path avoiding moving robots, length {path_length}"
+                            f"Robot {robot.id}: Found path to P{robot.target.priority} task, length {path_length}"
                         )
                     else:
                         self.add_status_message(
                             f"Robot {robot.id}: No path to P{robot.target.priority} task"
                         )
+                        # If no path found, clear target and try another task
                         robot.target = None
                         continue
                     robot.path.pop(0)  # Remove current position
@@ -368,37 +347,42 @@ class Game:
             if robot.path:
                 next_pos = robot.path[0]
                 
-                # Check for collision with other robots' current and next positions
+                # Check for collision
                 collision = False
                 for other_robot in self.robots:
                     if other_robot != robot:
-                        current_pos = (other_robot.x, other_robot.y)
-                        next_other_pos = other_robot.path[0] if other_robot.path else current_pos
-                        if next_pos == current_pos or next_pos == next_other_pos:
+                        # Check current position and next planned position
+                        if ((other_robot.x, other_robot.y) == next_pos or
+                            (other_robot.path and other_robot.path[0] == next_pos) or
+                            # Check if robots are facing each other
+                            (other_robot.path and 
+                             (other_robot.x, other_robot.y) == robot.path[-1] and
+                             (robot.x, robot.y) == other_robot.path[-1])):
+                            
                             collision = True
+                            # Clear path to force rerouting
+                            robot.path = []
+                            self.add_status_message(f"Robot {robot.id}: Rerouting to avoid collision with Robot {other_robot.id}")
                             break
 
-                if collision:
-                    robot.path = []  # Clear path to force rerouting
-                    continue
-
-                # If no collision, proceed with movement
-                self.grid[robot.y][robot.x] = CellType.EMPTY
-                robot.x, robot.y = next_pos
-                self.grid[robot.y][robot.x] = CellType.ROBOT
-                robot.path.pop(0)
-                robot.last_move_time = current_time
-                robot.total_distance += 1
-                robot.waiting = False
-                
-                if robot.target and (robot.x, robot.y) == robot.target.get_position():
-                    completed_priority = robot.target.priority
-                    robot.target = None
-                    robot.completed_tasks += 1
-                    self.total_tasks_completed += 1
-                    self.add_status_message(
-                        f"Robot {robot.id}: Completed P{completed_priority} task! Total: {robot.completed_tasks}"
-                    )
+                if not collision:
+                    # Update grid and robot position
+                    self.grid[robot.y][robot.x] = CellType.EMPTY
+                    robot.x, robot.y = next_pos
+                    self.grid[robot.y][robot.x] = CellType.ROBOT
+                    robot.path.pop(0)
+                    robot.last_move_time = current_time
+                    robot.total_distance += 1
+                    robot.waiting = False
+                    
+                    if robot.target and (robot.x, robot.y) == robot.target.get_position():
+                        completed_priority = robot.target.priority
+                        robot.target = None
+                        robot.completed_tasks += 1
+                        self.total_tasks_completed += 1
+                        self.add_status_message(
+                            f"Robot {robot.id}: Completed P{completed_priority} task! Total: {robot.completed_tasks}"
+                        )
 
         
         # Check if simulation should end
