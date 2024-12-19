@@ -89,7 +89,7 @@ class Game:
                     self.grid[grid_y][grid_x] = CellType.ROBOT
                     
                     # Create a new robot object and assign properties
-                    new_robot = Robot(grid_x, grid_y, self.robot_counter)
+                    new_robot = Robot(grid_x, grid_y, self.robot_counter)  # Pass id and dqn
                     
                     # Increment robot counter and assign it to the robot
                     self.robot_counter += 1
@@ -315,21 +315,10 @@ class Game:
 
             if not robot.path:
                 if robot.target:
-                    # Create a temporary grid with other robots marked as obstacles
-                    temp_grid = [row[:] for row in self.grid]  # Create a deep copy
-                    for other_robot in self.robots:
-                        if other_robot != robot:
-                            temp_grid[other_robot.y][other_robot.x] = CellType.OBSTACLE
-                    
-                    # Use the temporary grid for pathfinding
-                    self.astar.grid = temp_grid
                     robot.path = self.astar.find_path(
                         (robot.x, robot.y),
                         robot.target.get_position()
                     )
-                    # Restore original grid in A*
-                    self.astar.grid = self.grid
-                    
                     if robot.path:
                         path_length = len(robot.path)
                         self.add_status_message(
@@ -349,25 +338,42 @@ class Game:
                 
                 # Check for collision
                 collision = False
+                colliding_robot = None
                 for other_robot in self.robots:
                     if other_robot != robot:
-                        # Check current position and next planned position
-                        if ((other_robot.x, other_robot.y) == next_pos or
-                            (other_robot.path and other_robot.path[0] == next_pos) or
-                            # Check if robots are facing each other
-                            (other_robot.path and 
-                             (other_robot.x, other_robot.y) == robot.path[-1] and
-                             (robot.x, robot.y) == other_robot.path[-1])):
-                            
+                        # Check current position
+                        if (other_robot.x, other_robot.y) == next_pos:
                             collision = True
-                            # Clear path to force rerouting
-                            robot.path = []
-                            self.add_status_message(f"Robot {robot.id}: Rerouting to avoid collision with Robot {other_robot.id}")
+                            colliding_robot = other_robot
                             break
+                        # Check if other robot is planning to move to our next position
+                        elif (other_robot.path and 
+                              other_robot.path[0] == next_pos):
+                            # Consider task priorities in collision resolution
+                            if robot.target and other_robot.target:
+                                if robot.target.priority < other_robot.target.priority:
+                                    collision = True
+                                    colliding_robot = other_robot
+                                    break
+                                elif robot.target.priority == other_robot.target.priority:
+                                    # If same priority, consider waiting time and distance
+                                    if robot.waiting_time < other_robot.waiting_time:
+                                        collision = True
+                                        colliding_robot = other_robot
+                                        break
+                                    elif robot.waiting_time == other_robot.waiting_time:
+                                        # If same waiting time, let robot closer to target proceed
+                                        if (other_robot.target and
+                                            other_robot.manhattan_distance((other_robot.x, other_robot.y), other_robot.target.get_position()) < 
+                                            robot.manhattan_distance((robot.x, robot.y), robot.target.get_position())):
+                                            collision = True
+                                            colliding_robot = other_robot
+                                            break
 
                 if not collision:
                     # Update grid and robot position
                     self.grid[robot.y][robot.x] = CellType.EMPTY
+                    old_pos = (robot.x, robot.y)
                     robot.x, robot.y = next_pos
                     self.grid[robot.y][robot.x] = CellType.ROBOT
                     robot.path.pop(0)

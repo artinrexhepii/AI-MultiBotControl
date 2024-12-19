@@ -70,6 +70,7 @@ class PerformanceMetrics:
 
     @staticmethod
     def format_metrics(metrics):
+        """Format metrics for display"""
         return [
             f"Time: {metrics['total_time']:.1f}s",
             f"Tasks: {metrics['total_tasks']} ({metrics['tasks_per_second']:.2f}/s)",
