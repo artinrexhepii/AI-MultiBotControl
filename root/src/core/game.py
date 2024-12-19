@@ -91,7 +91,7 @@ class Game:
         elif self.current_tool == 'task':
             task = self.grid.add_task(x, y)
             if task:
-                self.add_status_message(f"Created P{task.priority} task at ({x}, {y})")
+                self.add_status_message(f"Created P{task.priority} task at ({x}, {task.y})")
                 if self.simulation_running:
                     self.auction_tasks()
 
@@ -222,14 +222,12 @@ class Game:
         # Collect bids from all unassigned robots for all tasks
         for robot in unassigned_robots:
             for task in available_tasks:
-                # Skip if task is too close to robot's current position
-                if abs(robot.x - task.x) + abs(robot.y - task.y) < 2:
-                    continue
-                    
                 chosen_task, bid_value = self.madql.calculate_bid(robot, [task])
                 if chosen_task:
                     all_bids.append((robot, chosen_task, bid_value))
                     print(f"Robot {robot.id} bid {bid_value:.2f} for task at ({task.x}, {task.y})")
+                else:
+                    print(f"Robot {robot.id} could not bid for task at ({task.x}, {task.y})")
         
         if not all_bids:
             print("No valid bids received")
@@ -324,7 +322,7 @@ class Game:
             # Skip robots without targets
             if not robot.target:
                 continue
-                
+            
             # If robot has no path, try to find one
             if not robot.path:
                 path = self.astar.find_path(
@@ -354,17 +352,12 @@ class Game:
                     robot.x, robot.y = next_pos
                     robot.path.pop(0)
                     
-                    # Check if robot has reached a task
-                    cell = self.grid.get_cell(robot.x, robot.y)
-                    if cell in [CellType.TASK, CellType.TARGET]:
-                        completed_task = None
-                        for task in self.grid.tasks:
-                            if task.x == robot.x and task.y == robot.y:
-                                completed_task = task
-                                break
-                                
-                        if completed_task:
-                            # Remove the task
+                    # Check if robot has reached its target task
+                    if robot.target and (robot.x, robot.y) == (robot.target.x, robot.target.y):
+                        completed_task = robot.target
+                        
+                        # Remove the task
+                        if completed_task in self.grid.tasks:
                             self.grid.tasks.remove(completed_task)
                             print(f"Robot {robot.id} completed task at ({completed_task.x}, {completed_task.y})")
                             
@@ -379,7 +372,7 @@ class Game:
                                     other_robot.target = None
                                     other_robot.path = []
                             
-                            # Clear robot's target and path
+                            # Clear robot's target and path but keep its position
                             robot.target = None
                             robot.path = []
                             

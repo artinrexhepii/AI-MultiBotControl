@@ -61,8 +61,11 @@ class Grid:
                 print("Move failed: Position occupied by another robot")
                 return False
             
-        # Move robot
+        # Clear the robot's current position
         self.grid[robot.y][robot.x] = CellType.EMPTY
+        
+        # Always mark the new position as ROBOT, even if it's a task cell
+        # The game logic will handle task completion separately
         self.grid[new_y][new_x] = CellType.ROBOT
         
         print(f"Move successful: Robot now at ({new_x}, {new_y})")
@@ -173,16 +176,20 @@ class Grid:
             return False
         return all(self.get_cell(x, y) != CellType.OBSTACLE for x, y in path)
         
-    def get_neighbors(self, x, y):
+    def get_neighbors(self, x, y, ignore_tasks=False):
         """Get valid neighboring cells"""
         neighbors = []
         for dx, dy in [(0,1), (1,0), (0,-1), (-1,0)]:
             new_x, new_y = x + dx, y + dy
-            if (0 <= new_x < GRID_SIZE and 0 <= new_y < GRID_SIZE and
-                self.grid[new_y][new_x] != CellType.OBSTACLE):
+            if 0 <= new_x < GRID_SIZE and 0 <= new_y < GRID_SIZE:
+                cell = self.grid[new_y][new_x]
+                # Only obstacles are invalid neighbors
+                if cell == CellType.OBSTACLE:
+                    continue
+                # Always allow task cells as valid neighbors
                 neighbors.append((new_x, new_y))
-        return neighbors 
-
+        return neighbors
+        
     def get_task_at(self, x, y):
         """Get task at given position"""
         for task in self.tasks:

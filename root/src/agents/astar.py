@@ -13,7 +13,7 @@ class AStar:
         """Calculate Manhattan distance between two positions"""
         return abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
         
-    def get_neighbors(self, pos, blocked_positions=None, robot=None, is_target_cell=False):
+    def get_neighbors(self, pos, blocked_positions=None, robot=None, is_target_cell=False, ignore_tasks=False, ignore_robots=False):
         """Get valid neighboring positions with improved collision avoidance"""
         if blocked_positions is None:
             blocked_positions = set()
@@ -21,18 +21,26 @@ class AStar:
         neighbors = []
         x, y = pos
         
+        print(f"Getting neighbors for position ({x}, {y})")
+        
         # Only consider 4 cardinal directions (no diagonals)
         for dx, dy in [(0,1), (1,0), (0,-1), (-1,0)]:
             new_x, new_y = x + dx, y + dy
             new_pos = (new_x, new_y)
             
+            # Check grid boundaries
             if not (0 <= new_x < GRID_SIZE and 0 <= new_y < GRID_SIZE):
                 continue
                 
             cell = self.game.grid.get_cell(new_x, new_y)
+            print(f"  Checking neighbor ({new_x}, {new_y}): {cell}")
             
-            # Strict collision avoidance - never allow moving into a cell with a robot
-            if cell == CellType.ROBOT:
+            # Handle different cell types
+            if cell == CellType.OBSTACLE:
+                print(f"  Skipping obstacle at ({new_x}, {new_y})")
+                continue
+                
+            if cell == CellType.ROBOT and not ignore_robots:
                 # Only allow if it's the target cell AND the robot there is about to move
                 if is_target_cell:
                     robot_at_pos = None
@@ -45,49 +53,63 @@ class AStar:
                         # Verify the robot will move before we get there
                         time_to_move = len(robot_at_pos.path) * MOVE_DELAY
                         if time_to_move < 1.0:  # If robot will move within 1 second
+                            print(f"  Adding robot position with high cost at ({new_x}, {new_y})")
                             neighbors.append((new_pos, 5.0))  # High cost to prefer other paths
+                    else:
+                        print(f"  Skipping robot position at ({new_x}, {new_y})")
                 continue
             
-            # Check if cell is valid for movement
-            if cell == CellType.OBSTACLE:
+            # Always allow task cells as valid neighbors
+            if cell in [CellType.TASK, CellType.TARGET]:
+                print(f"  Adding task position at ({new_x}, {new_y})")
+                neighbors.append((new_pos, 1.0))
                 continue
-                
+            
             # Check blocked positions
             if new_pos in blocked_positions and not is_target_cell:
+                print(f"  Position ({new_x}, {new_y}) is blocked")
                 continue
-                
-            # Check for nearby robots to prevent getting too close
-            too_close = False
-            for other_robot in self.game.robots:
-                if other_robot != robot:
-                    dist = self.manhattan_distance(new_pos, (other_robot.x, other_robot.y))
-                    if dist < 2:  # Minimum separation of 2 cells
-                        too_close = True
-                        break
             
-            if too_close and not is_target_cell:
-                continue
+            # Check for nearby robots if not ignoring them
+            if not ignore_robots:
+                too_close = False
+                for other_robot in self.game.robots:
+                    if other_robot != robot:
+                        dist = self.manhattan_distance(new_pos, (other_robot.x, other_robot.y))
+                        if dist < 2:  # Minimum separation of 2 cells
+                            too_close = True
+                            print(f"  Position ({new_x}, {new_y}) is too close to robot {other_robot.id}")
+                            break
                 
+                if too_close and not is_target_cell:
+                    continue
+            
             # Add position with movement cost
             base_cost = 1.0
             
-            # Add congestion cost
-            congestion_cost = 0.0
-            for other_robot in self.game.robots:
-                if other_robot != robot:
-                    dist = self.manhattan_distance(new_pos, (other_robot.x, other_robot.y))
-                    if dist < self.safety_distance:
-                        congestion_cost += (self.safety_distance - dist) * 0.5
+            # Add congestion cost if not ignoring robots
+            if not ignore_robots:
+                congestion_cost = 0.0
+                for other_robot in self.game.robots:
+                    if other_robot != robot:
+                        dist = self.manhattan_distance(new_pos, (other_robot.x, other_robot.y))
+                        if dist < self.safety_distance:
+                            congestion_cost += (self.safety_distance - dist) * 0.5
                         
-                    # Add cost for moving towards other robot's path
-                    if other_robot.path:
-                        for i, path_pos in enumerate(other_robot.path[:5]):  # Check next 5 steps
-                            if path_pos == new_pos:
-                                congestion_cost += 2.0 / (i + 1)  # Higher cost for immediate conflicts
-            
-            total_cost = base_cost + congestion_cost
-            neighbors.append((new_pos, total_cost))
+                        # Add cost for moving towards other robot's path
+                        if other_robot.path:
+                            for i, path_pos in enumerate(other_robot.path[:5]):  # Check next 5 steps
+                                if path_pos == new_pos:
+                                    congestion_cost += 2.0 / (i + 1)  # Higher cost for immediate conflicts
                 
+                total_cost = base_cost + congestion_cost
+            else:
+                total_cost = base_cost
+            
+            print(f"  Adding position ({new_x}, {new_y}) with cost {total_cost:.2f}")
+            neighbors.append((new_pos, total_cost))
+        
+        print(f"Found {len(neighbors)} valid neighbors")
         return neighbors
         
     def _is_position_safe(self, pos, robot, is_target_cell):
@@ -114,14 +136,20 @@ class AStar:
         
         return True
         
-    def find_path(self, start, goal, blocked_positions=None, robot=None):
+    def find_path(self, start, goal, blocked_positions=None, robot=None, ignore_robots=False, ignore_tasks=False):
         """Find path using A* algorithm with improved collision avoidance"""
         if blocked_positions is None:
             blocked_positions = set()
             
         # Check if start or goal is blocked
-        if self.game.grid.get_cell(*start) == CellType.OBSTACLE:
-            print(f"Path finding failed: Start is blocked")
+        start_cell = self.game.grid.get_cell(*start)
+        goal_cell = self.game.grid.get_cell(*goal)
+        
+        print(f"Path finding from {start} to {goal}")
+        print(f"Start cell type: {start_cell}, Goal cell type: {goal_cell}")
+        
+        if start_cell == CellType.OBSTACLE:
+            print(f"Path finding failed: Start position is blocked")
             return None
             
         # Initialize data structures
@@ -133,16 +161,19 @@ class AStar:
         # Keep track of explored alternatives
         alternatives = []
         max_alternatives = 3
+        explored_count = 0
         
         # Search for path
         while frontier:
             current = heapq.heappop(frontier)[1]
+            explored_count += 1
             
             if current == goal:
                 # Found a path, store it as an alternative
                 path = self._reconstruct_path(came_from, start, goal)
                 if path:
                     alternatives.append(path)
+                    print(f"Found path of length {len(path)}")
                     if len(alternatives) >= max_alternatives:
                         break
                 continue
@@ -151,12 +182,17 @@ class AStar:
             is_target_cell = (current == goal)
             
             # Get valid neighbors (only cardinal directions)
-            for next_pos, move_cost in self.get_neighbors(current, blocked_positions, robot, is_target_cell):
+            neighbors = self.get_neighbors(current, blocked_positions, robot if not ignore_robots else None, is_target_cell, ignore_tasks, ignore_robots)
+            if not neighbors:
+                print(f"No valid neighbors found for position {current}")
+            
+            for next_pos, move_cost in neighbors:
                 # Calculate new cost including movement cost
                 new_cost = cost_so_far[current] + move_cost
                 
-                # Add costs for various factors
-                new_cost += self._calculate_position_cost(next_pos, robot, goal)
+                # Add costs for various factors if not ignoring robots
+                if not ignore_robots:
+                    new_cost += self._calculate_position_cost(next_pos, robot, goal)
                 
                 if next_pos not in cost_so_far or new_cost < cost_so_far[next_pos]:
                     cost_so_far[next_pos] = new_cost
@@ -164,17 +200,21 @@ class AStar:
                     heapq.heappush(frontier, (priority, next_pos))
                     came_from[next_pos] = current
         
+        print(f"Explored {explored_count} positions")
+        
         # Choose the best alternative path
         if alternatives:
             # Sort alternatives by length and congestion
             scored_paths = []
             for path in alternatives:
-                congestion = sum(self._calculate_path_congestion(path, robot))
-                score = len(path) + congestion * 2  # Weight congestion more heavily
+                congestion = sum(self._calculate_path_congestion(path, robot if not ignore_robots else None))
+                score = len(path) + (congestion * 2 if not ignore_robots else 0)  # Weight congestion more heavily
                 scored_paths.append((score, path))
             
             # Return the path with the lowest score
-            return min(scored_paths, key=lambda x: x[0])[1]
+            best_path = min(scored_paths, key=lambda x: x[0])[1]
+            print(f"Selected best path of length {len(best_path)}")
+            return best_path
         
         print(f"No path found from {start} to {goal}")
         return None
